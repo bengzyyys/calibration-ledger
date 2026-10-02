@@ -66,45 +66,77 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var opts options
-	// 手工解析位于子命令前后的全局参数，flag 包不支持子命令前的散落标志。
-	rest := args
-	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
-		a := rest[0]
+	fileSet := false
+	cmd := ""
+	businessArgs := make([]string, 0, len(args))
+	// 全局参数（-f/--file、--json）既可以写在子命令前，也可以与器具编号、
+	// 证书编号等业务参数交错写在子命令之后。这里先从左到右扫描整条命令行，
+	// 剥除全局参数并确定最终台账路径，再打开该文件：因此 -f 出现的位置不会
+	// 改变它选中的台账；同一次调用出现多个文件参数时，短名与长名共同参与
+	// 从左到右的顺序，以最后一次明确给出的路径为准。
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if cmd == "" && !strings.HasPrefix(a, "-") {
+			// 第一个不以“-”开头的参数是子命令；其后的位置参数仍要继续扫描。
+			cmd = a
+			continue
+		}
 		switch {
-		case a == "-f" || a == "--file":
-			if len(rest) < 2 {
+		case a == "-f" || a == "--file" || a == "-file":
+			if i+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s 需要一个值\n", a)
 				return 2
 			}
-			opts.file = rest[1]
-			rest = rest[2:]
+			i++
+			opts.file = args[i]
+			fileSet = true
 		case strings.HasPrefix(a, "--file="):
-			opts.file = strings.TrimPrefix(a, "--file=")
-			rest = rest[1:]
+			opts.file = a[len("--file="):]
+			fileSet = true
+		case strings.HasPrefix(a, "-file="):
+			opts.file = a[len("-file="):]
+			fileSet = true
+		case strings.HasPrefix(a, "-f="):
+			opts.file = strings.TrimPrefix(a, "-f=")
+			fileSet = true
 		case strings.HasPrefix(a, "-f") && len(a) > 2:
 			opts.file = a[2:]
-			rest = rest[1:]
-		case a == "--json":
+			fileSet = true
+		case a == "--json" || a == "-json":
 			opts.asJSON = true
-			rest = rest[1:]
+		case a == "--" && cmd != "":
+			// “--” 终止后续标志解析：其后的参数原样交给子命令
+			// （与此前 flag 包的行为一致），即使其中出现 -f 也不再视为全局参数。
+			businessArgs = append(businessArgs, args[i:]...)
+			i = len(args)
 		default:
-			fmt.Fprintf(stderr, "未知全局参数 %s\n\n%s", a, usageText)
-			return 2
+			if cmd == "" {
+				fmt.Fprintf(stderr, "未知全局参数 %s\n\n%s", a, usageText)
+				return 2
+			}
+			businessArgs = append(businessArgs, a)
 		}
 	}
-	if opts.file == "" {
+	if fileSet {
+		if strings.TrimSpace(opts.file) == "" {
+			fmt.Fprintln(stderr, "台账文件路径不能为空或只有空白")
+			return 2
+		}
+	} else {
 		opts.file = "ledger.json"
 	}
-	if len(rest) == 0 {
+	if cmd == "" {
 		fmt.Fprint(stderr, usageText)
 		return 2
 	}
-	cmd, cmdArgs := rest[0], rest[1:]
+	cmdArgs := businessArgs
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usageText)
 		return 0
 	}
 
+	// 最终路径确定之后才打开台账：被后续 -f 覆盖掉的旧路径与默认文件
+	// 即使损坏或不可读，也不会影响对有效目标文件的操作。
 	l, err := calibrate.Open(opts.file)
 	if err != nil {
 		fmt.Fprintln(stderr, "打开台账失败：", err)
@@ -140,12 +172,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// newFlagSet 构造子命令自己的标志集，全局参数仍可写在子命令之后。
+// newFlagSet 构造子命令自己的标志集。台账文件与 --json 已在打开台账前
+// 从整条命令行统一解析，这里只保留 --json 的登记，绝不在此处重新登记
+// -f/--file：否则子命令后的文件参数会指向与已打开台账不同的路径。
 func newFlagSet(name string, opts *options) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&opts.file, "f", opts.file, "台账文件路径")
-	fs.StringVar(&opts.file, "file", opts.file, "台账文件路径")
 	fs.BoolVar(&opts.asJSON, "json", opts.asJSON, "以 JSON 输出")
 	return fs
 }

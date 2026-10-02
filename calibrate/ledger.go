@@ -197,28 +197,28 @@ func (l *Ledger) Path() string { return l.path }
 // 保证无效录入中断时不会留下半份记录。
 func (l *Ledger) save() error {
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
-		return fmt.Errorf("创建台账目录: %w", err)
+		return fmt.Errorf("写入台账文件 %s 前创建目录失败: %w", l.path, err)
 	}
 	raw, err := json.MarshalIndent(l.data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("序列化台账: %w", err)
+		return fmt.Errorf("序列化台账 %s: %w", l.path, err)
 	}
 	raw = append(raw, '\n')
 	tmp, err := os.CreateTemp(filepath.Dir(l.path), ".ledger-*.tmp")
 	if err != nil {
-		return fmt.Errorf("创建临时台账: %w", err)
+		return fmt.Errorf("为台账 %s 创建临时文件: %w", l.path, err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
-		return fmt.Errorf("写入临时台账: %w", err)
+		return fmt.Errorf("写入台账 %s 的临时文件: %w", l.path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("关闭临时台账: %w", err)
+		return fmt.Errorf("关闭台账 %s 的临时文件: %w", l.path, err)
 	}
 	if err := os.Rename(tmpName, l.path); err != nil {
-		return fmt.Errorf("替换台账文件: %w", err)
+		return fmt.Errorf("替换台账文件 %s: %w", l.path, err)
 	}
 	return nil
 }
