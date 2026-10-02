@@ -86,6 +86,7 @@ type ledgerData struct {
 	Instruments  []Instrument  `json:"instruments"`
 	Certificates []Certificate `json:"certificates"`
 	Usage        []UsageRecord `json:"usage"`
+	Plans        []Plan        `json:"plans,omitempty"`
 }
 
 // Ledger 是一份可操作的本地台账。
@@ -525,11 +526,12 @@ type InstrumentReview struct {
 	Latest     *CertificateView  `json:"latest"`
 	History    []CertificateView `json:"history"`
 	Rejections []UsageRecord     `json:"rejections"`
+	Plans      []PlanView        `json:"plans"`
 }
 
 // Review 按器具核对：登记信息、当前能否使用及原因、最近证书与到期日、
-// 全部历史证书以及被拒绝的使用记录。历史拒绝原因按申请当时的冻结内容展示，
-// 不随后来补录证书或切换状态而改变。
+// 全部历史证书、被拒绝的使用记录以及该器具当前与已结束的校准计划。
+// 历史拒绝原因按申请当时的冻结内容展示，不随后来补录证书或切换状态而改变。
 func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	inst, d := l.evaluate(id)
 	if inst == nil {
@@ -553,6 +555,7 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 			r.Rejections = append(r.Rejections, u)
 		}
 	}
+	r.Plans = l.planViews(id, today)
 	return r, nil
 }
 

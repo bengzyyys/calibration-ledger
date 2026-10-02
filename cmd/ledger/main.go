@@ -36,6 +36,12 @@ const usageText = `本地器具校准台账（仅本机，不连接真实实验�
   use        申请使用器具：--id 编号（允许与拒绝都会留痕）
   review     按器具核对：--id 编号
   list       列出全部登记器具
+  plan       建立校准计划：--instrument 器具编号 --number 计划编号 \
+             --date YYYY-MM-DD --note 非空说明
+  reschedule 计划改期：--number 计划编号 --date 新日期 --reason 非空原因
+  cancel     取消计划：--number 计划编号 --reason 非空原因
+  complete   用证书完成计划：--number 计划编号 --certificate 证书编号
+  todos      校准待办：[--instrument 器具编号]（默认全部未结束计划）
 
 通用参数：
   -f, --file   台账文件路径（默认 ledger.json）
@@ -118,6 +124,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReview(l, cmdArgs, opts, stdout, stderr)
 	case "list":
 		return cmdList(l, cmdArgs, opts, stdout, stderr)
+	case "plan":
+		return cmdPlan(l, cmdArgs, opts, stdout, stderr)
+	case "reschedule":
+		return cmdReschedule(l, cmdArgs, opts, stdout, stderr)
+	case "cancel":
+		return cmdCancel(l, cmdArgs, opts, stdout, stderr)
+	case "complete":
+		return cmdComplete(l, cmdArgs, opts, stdout, stderr)
+	case "todos":
+		return cmdTodos(l, cmdArgs, opts, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "未知子命令 %q\n\n%s", cmd, usageText)
 		return 2
@@ -398,6 +414,32 @@ func cmdReview(l *calibrate.Ledger, args []string, opts options, stdout, stderr 
 			}
 		}
 	}
+	if len(r.Plans) == 0 {
+		sb.WriteString("  校准计划：无\n")
+	} else {
+		sb.WriteString("  校准计划（含当前及已结束计划、改期记录与关联证书）：\n")
+		for _, p := range r.Plans {
+			head := fmt.Sprintf("    - %s %s 状态：%s", p.Number, p.PlannedDate, p.Status)
+			if p.Open() {
+				head += "（" + p.Marker + "）"
+			}
+			if p.OriginalDate != p.PlannedDate {
+				head += fmt.Sprintf("，最初计划日期 %s", p.OriginalDate)
+			}
+			head += "，说明：" + p.Note + "\n"
+			sb.WriteString(head)
+			for _, ch := range p.Changes {
+				fmt.Fprintf(&sb, "        改期 %s → %s（%s），原因：%s\n",
+					ch.From, ch.To, ch.ChangedAt, ch.Reason)
+			}
+			if p.Status == calibrate.PlanStatusCanceled {
+				fmt.Fprintf(&sb, "        取消于 %s，原因：%s\n", p.CanceledAt, p.CancelReason)
+			}
+			if p.Status == calibrate.PlanStatusDone {
+				fmt.Fprintf(&sb, "        完成于 %s，证书 %s\n", p.CompletedAt, p.CertificateNumber)
+			}
+		}
+	}
 	return emit(opts, stdout, stderr, sb.String(), r)
 }
 
@@ -431,4 +473,163 @@ func cmdList(l *calibrate.Ledger, args []string, opts options, stdout, stderr io
 	}
 	return emit(opts, stdout, stderr, sb.String(),
 		map[string]any{"instruments": instruments, "count": len(instruments)})
+}
+
+// failPlanBusiness 是计划类命令共用的业务拒绝输出（退出码 1）。
+func failPlanBusiness(opts options, stdout, stderr io.Writer, err error, extra map[string]any) int {
+	resp := map[string]any{"accepted": false, "error": err.Error()}
+	for k, v := range extra {
+		resp[k] = v
+	}
+	return failBusiness(opts, stdout, stderr, err, resp)
+}
+
+func cmdPlan(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
+	fs := newFlagSet("plan", &opts)
+	instrument := fs.String("instrument", "", "器具编号")
+	number := fs.String("number", "", "计划编号（全台账唯一，不可复用）")
+	date := fs.String("date", "", "计划日期 YYYY-MM-DD（不早于今天）")
+	note := fs.String("note", "", "非空计划说明")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "plan 参数错误：", err)
+		return 2
+	}
+	missing := []string{}
+	for k, v := range map[string]string{
+		"--instrument": *instrument, "--number": *number, "--date": *date, "--note": *note,
+	} {
+		if strings.TrimSpace(v) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		fmt.Fprintln(stderr, "plan 缺少必填参数：", strings.Join(missing, "、"))
+		return 2
+	}
+	p, err := l.CreatePlan(calibrate.PlanInput{
+		Number: *number, InstrumentID: *instrument, Date: *date, Note: *note,
+	})
+	if err != nil {
+		if calibrate.IsValidation(err) || errors.Is(err, calibrate.ErrNotFound) {
+			return failPlanBusiness(opts, stdout, stderr, err, nil)
+		}
+		return failIO(stderr, err)
+	}
+	human := fmt.Sprintf("已为器具 %s 建立校准计划 %s，计划日期 %s，说明：%s\n",
+		p.InstrumentID, p.Number, p.PlannedDate, p.Note)
+	return emit(opts, stdout, stderr, human, map[string]any{"accepted": true, "plan": p})
+}
+
+func cmdReschedule(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
+	fs := newFlagSet("reschedule", &opts)
+	number := fs.String("number", "", "计划编号")
+	date := fs.String("date", "", "新计划日期 YYYY-MM-DD（不早于今天）")
+	reason := fs.String("reason", "", "非空改期原因")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "reschedule 参数错误：", err)
+		return 2
+	}
+	missing := []string{}
+	for k, v := range map[string]string{
+		"--number": *number, "--date": *date, "--reason": *reason,
+	} {
+		if strings.TrimSpace(v) == "" {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		fmt.Fprintln(stderr, "reschedule 缺少必填参数：", strings.Join(missing, "、"))
+		return 2
+	}
+	p, err := l.ReschedulePlan(*number, *date, *reason)
+	if err != nil {
+		if calibrate.IsValidation(err) || errors.Is(err, calibrate.ErrNotFound) {
+			return failPlanBusiness(opts, stdout, stderr, err, nil)
+		}
+		return failIO(stderr, err)
+	}
+	human := fmt.Sprintf("计划 %s 已改期为 %s（第 %d 次改期）。\n",
+		p.Number, p.PlannedDate, len(p.Changes))
+	return emit(opts, stdout, stderr, human, map[string]any{"accepted": true, "plan": p})
+}
+
+func cmdCancel(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
+	fs := newFlagSet("cancel", &opts)
+	number := fs.String("number", "", "计划编号")
+	reason := fs.String("reason", "", "非空取消原因")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "cancel 参数错误：", err)
+		return 2
+	}
+	if strings.TrimSpace(*number) == "" || strings.TrimSpace(*reason) == "" {
+		fmt.Fprintln(stderr, "cancel 必须提供 --number、--reason")
+		return 2
+	}
+	p, err := l.CancelPlan(*number, *reason)
+	if err != nil {
+		if calibrate.IsValidation(err) || errors.Is(err, calibrate.ErrNotFound) {
+			return failPlanBusiness(opts, stdout, stderr, err, nil)
+		}
+		return failIO(stderr, err)
+	}
+	human := fmt.Sprintf("计划 %s 已于 %s 取消，原因：%s；不再列入待办。\n",
+		p.Number, p.CanceledAt, p.CancelReason)
+	return emit(opts, stdout, stderr, human, map[string]any{"accepted": true, "plan": p})
+}
+
+func cmdComplete(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
+	fs := newFlagSet("complete", &opts)
+	number := fs.String("number", "", "计划编号")
+	certificate := fs.String("certificate", "", "证书编号")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "complete 参数错误：", err)
+		return 2
+	}
+	if strings.TrimSpace(*number) == "" || strings.TrimSpace(*certificate) == "" {
+		fmt.Fprintln(stderr, "complete 必须提供 --number、--certificate")
+		return 2
+	}
+	p, idempotent, err := l.CompletePlan(*number, *certificate)
+	if err != nil {
+		if calibrate.IsValidation(err) || errors.Is(err, calibrate.ErrNotFound) {
+			return failPlanBusiness(opts, stdout, stderr, err, nil)
+		}
+		return failIO(stderr, err)
+	}
+	note := "已完成"
+	if idempotent {
+		note = "该计划已由此证书完成，返回原结果，未刷新完成时间"
+	}
+	human := fmt.Sprintf("%s：计划 %s，证书 %s，完成时间 %s。\n",
+		note, p.Number, p.CertificateNumber, p.CompletedAt)
+	return emit(opts, stdout, stderr, human,
+		map[string]any{"accepted": true, "idempotent": idempotent, "plan": p})
+}
+
+func cmdTodos(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
+	fs := newFlagSet("todos", &opts)
+	instrument := fs.String("instrument", "", "只看该器具编号的待办")
+	if err := fs.Parse(args); err != nil {
+		fmt.Fprintln(stderr, "todos 参数错误：", err)
+		return 2
+	}
+	items, err := l.Todos(*instrument)
+	if err != nil {
+		if errors.Is(err, calibrate.ErrNotFound) {
+			return failBusiness(opts, stdout, stderr, err,
+				map[string]any{"found": false, "error": err.Error()})
+		}
+		return failIO(stderr, err)
+	}
+	var sb strings.Builder
+	if len(items) == 0 {
+		sb.WriteString("无待办。\n")
+	}
+	for _, it := range items {
+		fmt.Fprintf(&sb, "%s\t%s（%s，%s）\t%s\t%s\t%s\n",
+			it.PlanNumber, it.InstrumentID, it.InstrumentName, it.Status,
+			it.PlannedDate, it.Marker, it.Note)
+	}
+	return emit(opts, stdout, stderr, sb.String(),
+		map[string]any{"todos": items, "count": len(items)})
 }
