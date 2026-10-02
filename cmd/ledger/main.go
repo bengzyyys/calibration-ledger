@@ -52,8 +52,9 @@ const usageText = `本地器具校准台账（仅本机，不连接真实实验�
 
 // options 是所有子命令共用的全局参数。
 type options struct {
-	file   string
-	asJSON bool
+	file    string
+	fileSet bool // 是否显式给出过 -f/--file（即使给的是空值也算）
+	asJSON  bool
 }
 
 func main() {
@@ -66,10 +67,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	var opts options
-	// 手工解析位于子命令前后的全局参数，flag 包不支持子命令前的散落标志。
+	// 先解析子命令之前的全局参数；子命令之后的 -f/--file 也在下面统一扫描提取，
+	// 保证文件参数无论出现在子命令哪一侧、与业务参数如何交错，都选中同一份台账。
 	rest := args
-	for len(rest) > 0 && strings.HasPrefix(rest[0], "-") {
+	cmd := ""
+	for len(rest) > 0 {
 		a := rest[0]
+		if a == "--" {
+			rest = rest[1:]
+			break
+		}
+		if a == "-" || !strings.HasPrefix(a, "-") {
+			cmd = a
+			rest = rest[1:]
+			break
+		}
 		switch {
 		case a == "-f" || a == "--file":
 			if len(rest) < 2 {
@@ -77,12 +89,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			opts.file = rest[1]
+			opts.fileSet = true
 			rest = rest[2:]
 		case strings.HasPrefix(a, "--file="):
 			opts.file = strings.TrimPrefix(a, "--file=")
+			opts.fileSet = true
+			rest = rest[1:]
+		case strings.HasPrefix(a, "-f="):
+			opts.file = strings.TrimPrefix(a, "-f=")
+			opts.fileSet = true
 			rest = rest[1:]
 		case strings.HasPrefix(a, "-f") && len(a) > 2:
 			opts.file = a[2:]
+			opts.fileSet = true
 			rest = rest[1:]
 		case a == "--json":
 			opts.asJSON = true
@@ -92,19 +111,54 @@ func run(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	if opts.file == "" {
-		opts.file = "ledger.json"
-	}
-	if len(rest) == 0 {
+	if cmd == "" {
 		fmt.Fprint(stderr, usageText)
 		return 2
 	}
-	cmd, cmdArgs := rest[0], rest[1:]
+	// 子命令参数区中的 -f/--file 同样有效：原样保留用户给出的完整路径值，
+	// 同一次调用出现多个文件参数时，按从左到右顺序以最后一次明确给出的路径为准，
+	// 短名称与长名称共同参与排序。文件参数从业务参数序列中摘除，不交给子命令解析。
+	cmdArgs := rest
+	cleanArgs := make([]string, 0, len(cmdArgs))
+	for i := 0; i < len(cmdArgs); i++ {
+		a := cmdArgs[i]
+		switch {
+		case a == "-f" || a == "--file":
+			if i+1 >= len(cmdArgs) {
+				fmt.Fprintf(stderr, "%s 需要一个值\n", a)
+				return 2
+			}
+			opts.file = cmdArgs[i+1]
+			opts.fileSet = true
+			i++
+		case strings.HasPrefix(a, "--file="):
+			opts.file = strings.TrimPrefix(a, "--file=")
+			opts.fileSet = true
+		case strings.HasPrefix(a, "-f="):
+			opts.file = strings.TrimPrefix(a, "-f=")
+			opts.fileSet = true
+		case strings.HasPrefix(a, "-f") && len(a) > 2:
+			opts.file = a[2:]
+			opts.fileSet = true
+		default:
+			cleanArgs = append(cleanArgs, a)
+		}
+	}
+	// 没有文件参数时使用当前目录的 ledger.json；显式给出空或纯空白路径按参数错误处理，
+	// 不创建或改动任何台账。
+	if !opts.fileSet {
+		opts.file = "ledger.json"
+	} else if strings.TrimSpace(opts.file) == "" {
+		fmt.Fprintln(stderr, "台账文件路径不能为空或只有空白")
+		return 2
+	}
 	if cmd == "help" || cmd == "-h" || cmd == "--help" {
 		fmt.Fprint(stdout, usageText)
 		return 0
 	}
 
+	// 只打开最终选中的台账：默认文件或被后续参数覆盖的文件即使损坏、不可读取，
+	// 也不影响对有效目标文件的操作；目标文件损坏或读取失败时直接报错退出。
 	l, err := calibrate.Open(opts.file)
 	if err != nil {
 		fmt.Fprintln(stderr, "打开台账失败：", err)
@@ -113,39 +167,37 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	switch cmd {
 	case "register":
-		return cmdRegister(l, cmdArgs, opts, stdout, stderr)
+		return cmdRegister(l, cleanArgs, opts, stdout, stderr)
 	case "status":
-		return cmdStatus(l, cmdArgs, opts, stdout, stderr)
+		return cmdStatus(l, cleanArgs, opts, stdout, stderr)
 	case "cert":
-		return cmdCert(l, cmdArgs, opts, stdout, stderr)
+		return cmdCert(l, cleanArgs, opts, stdout, stderr)
 	case "use":
-		return cmdUse(l, cmdArgs, opts, stdout, stderr)
+		return cmdUse(l, cleanArgs, opts, stdout, stderr)
 	case "review":
-		return cmdReview(l, cmdArgs, opts, stdout, stderr)
+		return cmdReview(l, cleanArgs, opts, stdout, stderr)
 	case "list":
-		return cmdList(l, cmdArgs, opts, stdout, stderr)
+		return cmdList(l, cleanArgs, opts, stdout, stderr)
 	case "plan":
-		return cmdPlan(l, cmdArgs, opts, stdout, stderr)
+		return cmdPlan(l, cleanArgs, opts, stdout, stderr)
 	case "reschedule":
-		return cmdReschedule(l, cmdArgs, opts, stdout, stderr)
+		return cmdReschedule(l, cleanArgs, opts, stdout, stderr)
 	case "cancel":
-		return cmdCancel(l, cmdArgs, opts, stdout, stderr)
+		return cmdCancel(l, cleanArgs, opts, stdout, stderr)
 	case "complete":
-		return cmdComplete(l, cmdArgs, opts, stdout, stderr)
+		return cmdComplete(l, cleanArgs, opts, stdout, stderr)
 	case "todos":
-		return cmdTodos(l, cmdArgs, opts, stdout, stderr)
+		return cmdTodos(l, cleanArgs, opts, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "未知子命令 %q\n\n%s", cmd, usageText)
 		return 2
 	}
 }
 
-// newFlagSet 构造子命令自己的标志集，全局参数仍可写在子命令之后。
+// newFlagSet 构造子命令自己的标志集；文件参数由 run 统一提取，这里不再注册。
 func newFlagSet(name string, opts *options) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	fs.StringVar(&opts.file, "f", opts.file, "台账文件路径")
-	fs.StringVar(&opts.file, "file", opts.file, "台账文件路径")
 	fs.BoolVar(&opts.asJSON, "json", opts.asJSON, "以 JSON 输出")
 	return fs
 }
