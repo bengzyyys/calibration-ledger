@@ -463,3 +463,384 @@ func TestJSONAfterSubcommand(t *testing.T) {
 		t.Fatalf("list JSON 内容不符：%+v", listed)
 	}
 }
+
+// certJSON 是解析 cert --json 输出用的结构。
+type certJSON struct {
+	Accepted    bool `json:"accepted"`
+	Duplicate   bool `json:"duplicate"`
+	Certificate struct {
+		Number  string `json:"number"`
+		Method  string `json:"method"`
+		Summary string `json:"summary"`
+	} `json:"certificate"`
+}
+
+func parseCertJSON(t *testing.T, stdout string) certJSON {
+	t.Helper()
+	var got certJSON
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("解析 cert JSON 失败: %v\n%s", err, stdout)
+	}
+	return got
+}
+
+// 证书字段的值即使恰好是 --json，也必须按文字保存：不改变输出格式，
+// 不丢失字段，不影响录入成功。
+func TestCertFieldValueThatLooksLikeJSONFlag(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	// --summary 与 --json 分开传入：--json 是 --summary 的值，不是全局开关。
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "JJF", "--error", "0.1", "--summary", "--json")
+	if r.code != 0 {
+		t.Fatalf("摘要为 --json 时应录入成功，code=%d stderr=%s", r.code, r.stderr)
+	}
+	if strings.HasPrefix(r.stdout, "{") {
+		t.Fatal("未另行开启 JSON 输出时应保持普通文字输出")
+	}
+	if !strings.Contains(r.stdout, "已录入新证书") {
+		t.Fatalf("普通文字输出内容异常：%q", r.stdout)
+	}
+
+	// 开启 --json 核对：摘要文字必须完整出现在证书内容里。
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	if rj.code != 0 {
+		t.Fatal(rj.stderr)
+	}
+	var review struct {
+		History []struct {
+			Number  string `json:"number"`
+			Summary string `json:"summary"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	if len(review.History) != 1 || review.History[0].Summary != "--json" {
+		t.Fatalf("摘要文字未完整保存：%+v", review.History)
+	}
+}
+
+// 校准方法的值即使恰好是 -f备用.json，也必须按文字保存：不改变目标台账，
+// 不创建多余文件。分开传入与等号连传应得到相同的证书内容。
+func TestCertFieldValueThatLooksLikeFileFlag(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	// 分开传入：--method 的值是 -f备用.json，不得被剥成全局文件参数。
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "-f备用.json", "--error", "0.1", "--summary", "摘要")
+	if r.code != 0 {
+		t.Fatalf("方法为 -f备用.json 时应录入成功，code=%d stderr=%s", r.code, r.stderr)
+	}
+	if fileExists(t, filepath.Join(dir, "备用.json")) {
+		t.Fatal("字段值中的 -f 不得改变目标台账，不应创建备用.json")
+	}
+
+	// 等号连传：--method=-f备用.json 与分开传入内容一致。
+	r2 := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-2",
+		"--cal-date", "2026-09-02", "--expiry", "2027-09-02",
+		"--method=-f备用.json", "--error", "0.2", "--summary", "摘要")
+	if r2.code != 0 {
+		t.Fatalf("等号连传应录入成功，code=%d stderr=%s", r2.code, r2.stderr)
+	}
+
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	var review struct {
+		History []struct {
+			Number string `json:"number"`
+			Method string `json:"method"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, c := range review.History {
+		got[c.Number] = c.Method
+	}
+	if got["C-1"] != "-f备用.json" || got["C-2"] != "-f备用.json" {
+		t.Fatalf("分开传入与等号连传的方法内容应一致：%+v", got)
+	}
+}
+
+// 字段值中的中文、内部空格、等号、开头横线都必须原样保留，首尾空白沿用
+// 现有处理（trim 后判空、保存 trim 后的内容）。
+func TestCertFieldValueTextPreservation(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	method := "JJF 规范 = 等号"
+	summary := "--开头 横线 含 空格 = 等号"
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", method, "--error", "0.1", "--summary", summary)
+	if r.code != 0 {
+		t.Fatalf("录入失败 code=%d stderr=%s", r.code, r.stderr)
+	}
+
+	// 首尾空白：传入带首尾空白的值，保存 trim 后的内容。
+	r2 := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-2",
+		"--cal-date", "2026-09-02", "--expiry", "2027-09-02",
+		"--method", "  "+method+"  ", "--error", "0.2",
+		"--summary", "  "+summary+"  ")
+	if r2.code != 0 {
+		t.Fatalf("带首尾空白录入失败 code=%d stderr=%s", r2.code, r2.stderr)
+	}
+
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	var review struct {
+		History []struct {
+			Number  string `json:"number"`
+			Method  string `json:"method"`
+			Summary string `json:"summary"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range review.History {
+		if c.Number == "C-1" {
+			if c.Method != method || c.Summary != summary {
+				t.Fatalf("文字未原样保留：method=%q summary=%q", c.Method, c.Summary)
+			}
+		}
+		if c.Number == "C-2" {
+			if c.Method != method || c.Summary != summary {
+				t.Fatalf("首尾空白应 trim 后保存：method=%q summary=%q", c.Method, c.Summary)
+			}
+		}
+	}
+}
+
+// 真正作为命令设置的 -f/--file 和 --json 仍可穿插在已填写完整的证书字段
+// 之间，不影响字段值，也不改变目标台账与输出格式。
+func TestGenuineGlobalFlagsInterspersedBetweenFields(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	// -f 与 --json 穿插在完整字段之间：-f 选中目标，--json 开启 JSON 输出。
+	r := runArgs(t, "cert",
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "JJF", "-f", target, "--error", "0.1",
+		"--summary", "摘要", "--json")
+	if r.code != 0 {
+		t.Fatalf("穿插全局参数时录入失败 code=%d stderr=%s", r.code, r.stderr)
+	}
+	got := parseCertJSON(t, r.stdout)
+	if !got.Accepted || got.Certificate.Number != "C-1" {
+		t.Fatalf("JSON 输出内容异常：%+v", got)
+	}
+	if got.Certificate.Method != "JJF" || got.Certificate.Summary != "摘要" {
+		t.Fatalf("字段值被全局参数干扰：%+v", got.Certificate)
+	}
+}
+
+// 需要值的证书参数放在命令末尾却没有值时，明确报参数错误并退出 2，
+// 不创建证书或改动台账。
+func TestCertFlagMissingValueAtEnd(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "JJF", "--error", "0.1", "--summary")
+	if r.code != 2 {
+		t.Fatalf("末尾缺值应退出 2，得到 %d", r.code)
+	}
+	if fileExists(t, filepath.Join(dir, "ledger.json.bak")) {
+		t.Fatal("参数错误不应改动台账")
+	}
+	// 台账中不应出现任何证书。
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	var review struct {
+		History []json.RawMessage `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	if len(review.History) != 0 {
+		t.Fatal("缺值错误不应创建证书")
+	}
+}
+
+// 必填字段传入空字符串或只有空白时，明确报参数错误并退出 2。
+func TestCertBlankFieldValueRejected(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	cases := [][]string{
+		{"--summary", ""},
+		{"--summary", "   "},
+		{"--method", ""},
+		{"--method", "\t"},
+	}
+	for i, c := range cases {
+		args := []string{"cert", "-f", target,
+			"--instrument", "M-1", "--number", "C-1",
+			"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+			"--method", "JJF", "--error", "0.1", "--summary", "摘要"}
+		// 用当前用例替换对应字段的值。
+		flag := c[0]
+		for j := 0; j < len(args)-1; j++ {
+			if args[j] == flag {
+				args[j+1] = c[1]
+			}
+		}
+		r := runArgs(t, args...)
+		if r.code != 2 {
+			t.Fatalf("用例 %d 应退出 2，得到 %d（%v）", i, r.code, c)
+		}
+	}
+}
+
+// 有效的非空字段值即使长得像选项，也不能被判为缺值：--summary --json
+// 应录入成功，而不是报“缺少 --summary 的值”。
+func TestCertValidValueThatLooksLikeOptionNotMissing(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	// --summary --json：--json 是值，录入成功。
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "JJF", "--error", "0.1", "--summary", "--json")
+	if r.code != 0 {
+		t.Fatalf("长得像选项的有效值不应判为缺值，code=%d stderr=%s", r.code, r.stderr)
+	}
+
+	// --method -f备用.json：-f备用.json 是值，录入成功。
+	r2 := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-2",
+		"--cal-date", "2026-09-02", "--expiry", "2027-09-02",
+		"--method", "-f备用.json", "--error", "0.2", "--summary", "摘要")
+	if r2.code != 0 {
+		t.Fatalf("长得像文件选项的有效值不应判为缺值，code=%d stderr=%s", r2.code, r2.stderr)
+	}
+}
+
+// 退出后重新打开同一台账，字段中长得像选项的文字保持一致。
+func TestCertFieldValuePersistsAcrossReopen(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "-f备用.json", "--error", "0.1", "--summary", "--json")
+
+	// 重新打开：用另一条命令读取同一文件，内容必须一致。
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	var review struct {
+		History []struct {
+			Number  string `json:"number"`
+			Method  string `json:"method"`
+			Summary string `json:"summary"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	if len(review.History) != 1 {
+		t.Fatalf("重开后证书数量异常：%d", len(review.History))
+	}
+	c := review.History[0]
+	if c.Method != "-f备用.json" || c.Summary != "--json" {
+		t.Fatalf("重开后字段内容不一致：method=%q summary=%q", c.Method, c.Summary)
+	}
+}
+
+// 同号且业务内容一致时返回原证书，不增加历史；同号内容不同仍拒绝覆盖。
+// 字段值中长得像选项的文字不影响这两条判断。
+func TestCertIdempotencyAndConflictWithOptionLikeValues(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "ledger.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+
+	base := []string{
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "-f备用.json", "--error", "0.1", "--summary", "--json",
+	}
+	args := append([]string{"cert", "-f", target}, base...)
+	if r := runArgs(t, args...); r.code != 0 {
+		t.Fatalf("首次录入失败 code=%d stderr=%s", r.code, r.stderr)
+	}
+
+	// 同号同内容：幂等返回原证书，历史不增加。
+	args2 := append([]string{"cert", "-f", target, "--json"}, base...)
+	r2 := runArgs(t, args2...)
+	if r2.code != 0 {
+		t.Fatalf("幂等录入失败 code=%d stderr=%s", r2.code, r2.stderr)
+	}
+	got := parseCertJSON(t, r2.stdout)
+	if !got.Duplicate {
+		t.Fatal("同号同内容应返回原证书（duplicate=true）")
+	}
+
+	// 同号不同内容：冲突拒绝，不改动已有数据。
+	conflict := append([]string{"cert", "-f", target},
+		"--instrument", "M-1", "--number", "C-1",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "不同方法", "--error", "0.1", "--summary", "--json")
+	r3 := runArgs(t, conflict...)
+	if r3.code != 1 {
+		t.Fatalf("同号不同内容应冲突退出 1，得到 %d", r3.code)
+	}
+
+	// 历史仍只有一张证书，内容未被改动。
+	rj := runArgs(t, "review", "--id", "M-1", "-f", target, "--json")
+	var review struct {
+		History []struct {
+			Number  string `json:"number"`
+			Method  string `json:"method"`
+			Summary string `json:"summary"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(rj.stdout), &review); err != nil {
+		t.Fatal(err)
+	}
+	if len(review.History) != 1 {
+		t.Fatalf("冲突不应改动历史，现有 %d 张", len(review.History))
+	}
+	c := review.History[0]
+	if c.Method != "-f备用.json" || c.Summary != "--json" {
+		t.Fatalf("已有证书内容被改动：method=%q summary=%q", c.Method, c.Summary)
+	}
+}

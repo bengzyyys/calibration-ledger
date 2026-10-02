@@ -60,6 +60,39 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
+// subcommandValueFlags 记录各子命令需要取值的标志名（均为字符串标志）。
+// 全局参数扫描从左到右进行，本身不知道子命令标志的取值规则：cert --summary
+// --json 中的 --json 其实是 --summary 的值，cert --method -f备用.json 中的
+// -f备用.json 其实是 --method 的值。若把它们误剥成全局参数，就会丢字段、
+// 改错台账。因此扫描时遇到这些标志的“分离式”写法（--flag 后单独给值），
+// 必须把下一个参数原样当作该标志的值交给子命令，即使它恰好长得像 --json、
+// -f 也不解释为全局参数。
+var subcommandValueFlags = map[string]map[string]bool{
+	"register":  {"id": true, "name": true, "allowed": true},
+	"status":    {"id": true, "status": true},
+	"cert":      {"instrument": true, "number": true, "cal-date": true, "expiry": true, "method": true, "error": true, "summary": true},
+	"use":       {"id": true},
+	"review":    {"id": true},
+	"plan":      {"instrument": true, "number": true, "date": true, "note": true},
+	"reschedule": {"number": true, "date": true, "reason": true},
+	"cancel":    {"number": true, "reason": true},
+	"complete":  {"number": true, "certificate": true},
+	"todos":     {"instrument": true},
+}
+
+// isSubcommandValueFlag 判断 a（形如 --name 或 --name=value）是否是当前
+// 子命令需要取值的标志。
+func isSubcommandValueFlag(cmd, a string) bool {
+	if !strings.HasPrefix(a, "--") {
+		return false
+	}
+	name := a[2:]
+	if eq := strings.IndexByte(name, '='); eq >= 0 {
+		name = name[:eq]
+	}
+	return subcommandValueFlags[cmd][name]
+}
+
 func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, usageText)
@@ -74,6 +107,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 剥除全局参数并确定最终台账路径，再打开该文件：因此 -f 出现的位置不会
 	// 改变它选中的台账；同一次调用出现多个文件参数时，短名与长名共同参与
 	// 从左到右的顺序，以最后一次明确给出的路径为准。
+	//
+	// 扫描时必须识别子命令的取值标志：分离式写法（--flag 后单独给值）的
+	// 下一个参数是该标志的值，原样交给子命令，不能把其中恰好长得像
+	// --json、-f 的文字误判为全局参数而剥掉。
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if cmd == "" && !strings.HasPrefix(a, "-") {
@@ -82,6 +119,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 			continue
 		}
 		switch {
+		case cmd != "" && isSubcommandValueFlag(cmd, a):
+			// 子命令取值标志：分离式写法从下一个参数取值，原样交给子命令。
+			// 等号连写（--flag=value）时值已在 a 中，不再额外吃下一个参数。
+			businessArgs = append(businessArgs, a)
+			if !strings.Contains(a, "=") && i+1 < len(args) {
+				i++
+				businessArgs = append(businessArgs, args[i])
+			}
 		case a == "-f" || a == "--file" || a == "-file":
 			if i+1 >= len(args) {
 				fmt.Fprintf(stderr, "%s 需要一个值\n", a)
