@@ -86,6 +86,7 @@ type ledgerData struct {
 	Instruments  []Instrument  `json:"instruments"`
 	Certificates []Certificate `json:"certificates"`
 	Usage        []UsageRecord `json:"usage"`
+	Plans        []Plan        `json:"plans"`
 }
 
 // Ledger 是一份可操作的本地台账。
@@ -525,6 +526,7 @@ type InstrumentReview struct {
 	Latest     *CertificateView  `json:"latest"`
 	History    []CertificateView `json:"history"`
 	Rejections []UsageRecord     `json:"rejections"`
+	Plans      []Plan            `json:"plans"`
 }
 
 // Review 按器具核对：登记信息、当前能否使用及原因、最近证书与到期日、
@@ -553,6 +555,8 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 			r.Rejections = append(r.Rejections, u)
 		}
 	}
+	// 核对时同时展示该器具的当前计划与已结束计划、改期记录和关联证书编号。
+	r.Plans = l.PlansOf(id)
 	return r, nil
 }
 
