@@ -74,6 +74,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 剥除全局参数并确定最终台账路径，再打开该文件：因此 -f 出现的位置不会
 	// 改变它选中的台账；同一次调用出现多个文件参数时，短名与长名共同参与
 	// 从左到右的顺序，以最后一次明确给出的路径为准。
+	// 子命令的业务标志（--method、--summary 等）都需要值：不带等号时紧跟的
+	// 下一个参数就是它的值。值必须原样保留为字段内容——即使它看起来是
+	// -f、--file=…、-f… 或 --json，也不参与台账选择与输出格式设置；
+	// 只有出现在完整字段之外（或子命令之前）的同名写法才是全局参数。
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		if cmd == "" && !strings.HasPrefix(a, "-") {
@@ -115,6 +119,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			businessArgs = append(businessArgs, a)
+			// 业务标志不带等号时，下一个参数是它的字段值：原样一并转交子命令，
+			// 绝不再按全局参数解释（与 flag 包对字符串标志的取值行为一致）。
+			// 值缺失时不在这里补，由子命令解析时报“标志需要值”。
+			if strings.HasPrefix(a, "-") && !strings.Contains(a, "=") && i+1 < len(args) {
+				i++
+				businessArgs = append(businessArgs, args[i])
+			}
 		}
 	}
 	if fileSet {
