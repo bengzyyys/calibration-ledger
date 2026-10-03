@@ -126,11 +126,12 @@ func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 		CreatedAt:    l.now().Format(time.RFC3339),
 		Status:       PlanStatusOpen,
 	}
-	l.data.Plans = append(l.data.Plans, p)
-	if err := l.save(); err != nil {
+	if err := l.mutate(func() {
+		l.data.Plans = append(l.data.Plans, p)
+	}); err != nil {
 		return nil, err
 	}
-	return l.findPlan(number), nil
+	return &p, nil
 }
 
 // requireOpenPlan 找到计划并确认其尚未结束；已结束计划返回明确的校验错误。
@@ -167,14 +168,16 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 		return nil, err
 	}
 	// 即使新日期与当前日期相同也照常记录：保留修改前后的日期、操作时间和原因。
-	p.Changes = append(p.Changes, PlanChange{
+	change := PlanChange{
 		From:      p.PlannedDate,
 		To:        dateText,
 		ChangedAt: l.now().Format(time.RFC3339),
 		Reason:    reason,
-	})
-	p.PlannedDate = dateText
-	if err := l.save(); err != nil {
+	}
+	if err := l.mutate(func() {
+		p.Changes = append(p.Changes, change)
+		p.PlannedDate = dateText
+	}); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -195,10 +198,11 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.Status = PlanStatusCanceled
-	p.CanceledAt = l.now().Format(time.RFC3339)
-	p.CancelReason = reason
-	if err := l.save(); err != nil {
+	if err := l.mutate(func() {
+		p.Status = PlanStatusCanceled
+		p.CanceledAt = l.now().Format(time.RFC3339)
+		p.CancelReason = reason
+	}); err != nil {
 		return nil, err
 	}
 	return p, nil
@@ -268,10 +272,12 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 		}
 	}
 
-	p.Status = PlanStatusDone
-	p.CompletedAt = l.now().Format(time.RFC3339)
-	p.CertificateNumber = certificateNumber
-	if err := l.save(); err != nil {
+	completedAt := l.now().Format(time.RFC3339)
+	if err := l.mutate(func() {
+		p.Status = PlanStatusDone
+		p.CompletedAt = completedAt
+		p.CertificateNumber = certificateNumber
+	}); err != nil {
 		return nil, false, err
 	}
 	return p, false, nil

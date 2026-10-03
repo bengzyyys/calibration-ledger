@@ -464,6 +464,67 @@ func TestJSONAfterSubcommand(t *testing.T) {
 	}
 }
 
+// 证书录入在台账文件无法写入时按文件读写错误报告（退出 2），
+// 不输出任何录入成功信息，也不改动台账文件。
+func TestCertWriteFailureReportedAsIOError(t *testing.T) {
+	dir := chdirTemp(t)
+	target := filepath.Join(dir, "台账.json")
+	if r := runArgs(t, registerArgs(target, "M-1")...); r.code != 0 {
+		t.Fatal(r.stderr)
+	}
+	before, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 目录可读可进入但不可写：打开与读取台账不受影响，保存时无法创建临时文件。
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	for i, useJSON := range []bool{false, true} {
+		args := []string{"cert", "-f", target,
+			"--instrument", "M-1", "--number", "C-FAIL",
+			"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+			"--method", "规范", "--error", "0.1", "--summary", "保存失败"}
+		if useJSON {
+			args = append(args, "--json")
+		}
+		r := runArgs(t, args...)
+		if r.code != 2 {
+			t.Fatalf("用例 %d：保存失败应退出 2，得到 %d", i, r.code)
+		}
+		if strings.Contains(r.stdout, "已录入") || strings.Contains(r.stdout, `"accepted": true`) {
+			t.Fatalf("用例 %d：不得输出录入成功信息：stdout=%q", i, r.stdout)
+		}
+		if !strings.Contains(r.stderr, "操作失败") {
+			t.Fatalf("用例 %d：应按文件读写错误报告，stderr=%q", i, r.stderr)
+		}
+	}
+
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("保存失败后台账文件被改动")
+	}
+
+	// 恢复可写后重新提交相同内容，应作为新证书正常录入（失败未占用编号）。
+	r := runArgs(t, "cert", "-f", target,
+		"--instrument", "M-1", "--number", "C-FAIL",
+		"--cal-date", "2026-09-01", "--expiry", "2027-09-01",
+		"--method", "规范", "--error", "0.1", "--summary", "保存失败")
+	if r.code != 0 || !strings.Contains(r.stdout, "已录入新证书") {
+		t.Fatalf("恢复可写后应作为新证书录入，code=%d stdout=%q stderr=%s",
+			r.code, r.stdout, r.stderr)
+	}
+}
+
 // certArgs 构造一条录入证书的完整参数，便于按需替换个别字段。
 func certArgs(path, number, calDate, method, summary string) []string {
 	return []string{"cert", "-f", path,

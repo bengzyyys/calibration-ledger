@@ -125,6 +125,27 @@ func IsConflict(err error) bool {
 // ErrNotFound 表示编号在台账中不存在。
 var ErrNotFound = errors.New("记录不存在")
 
+// SaveError 表示业务校验已经通过，但台账内容无法写入或替换本机文件。
+// 此时内存中的台账保持本次操作前的状态：失败的录入不占用编号或日期位置，
+// 同一台账对象随后的查询结果也与录入前完全一致。
+type SaveError struct {
+	Msg string
+	Err error
+}
+
+func (e *SaveError) Error() string { return e.Msg }
+func (e *SaveError) Unwrap() error { return e.Err }
+
+// IsSaveError 报告 err 是否为台账文件保存错误。
+func IsSaveError(err error) bool {
+	var s *SaveError
+	return errors.As(err, &s)
+}
+
+func saveError(msg string, cause error) *SaveError {
+	return &SaveError{Msg: msg, Err: cause}
+}
+
 func cleanText(s string) (string, error) {
 	t := strings.TrimSpace(s)
 	if t == "" {
@@ -197,28 +218,59 @@ func (l *Ledger) Path() string { return l.path }
 // 保证无效录入中断时不会留下半份记录。
 func (l *Ledger) save() error {
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
-		return fmt.Errorf("写入台账文件 %s 前创建目录失败: %w", l.path, err)
+		return saveError(fmt.Sprintf("写入台账文件 %s 前创建目录失败: %v", l.path, err), err)
 	}
 	raw, err := json.MarshalIndent(l.data, "", "  ")
 	if err != nil {
-		return fmt.Errorf("序列化台账 %s: %w", l.path, err)
+		return saveError(fmt.Sprintf("序列化台账 %s: %v", l.path, err), err)
 	}
 	raw = append(raw, '\n')
 	tmp, err := os.CreateTemp(filepath.Dir(l.path), ".ledger-*.tmp")
 	if err != nil {
-		return fmt.Errorf("为台账 %s 创建临时文件: %w", l.path, err)
+		return saveError(fmt.Sprintf("为台账 %s 创建临时文件: %v", l.path, err), err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.Write(raw); err != nil {
 		tmp.Close()
-		return fmt.Errorf("写入台账 %s 的临时文件: %w", l.path, err)
+		return saveError(fmt.Sprintf("写入台账 %s 的临时文件: %v", l.path, err), err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("关闭台账 %s 的临时文件: %w", l.path, err)
+		return saveError(fmt.Sprintf("关闭台账 %s 的临时文件: %v", l.path, err), err)
 	}
 	if err := os.Rename(tmpName, l.path); err != nil {
-		return fmt.Errorf("替换台账文件 %s: %w", l.path, err)
+		return saveError(fmt.Sprintf("替换台账文件 %s: %v", l.path, err), err)
+	}
+	return nil
+}
+
+// cloneData 深拷贝一份台账数据。台账字段全部是 JSON 可序列化的基本类型，
+// 借助序列化得到与原数据不共享任何切片底层数组的独立副本。
+func cloneData(d ledgerData) (ledgerData, error) {
+	raw, err := json.Marshal(d)
+	if err != nil {
+		return ledgerData{}, err
+	}
+	var c ledgerData
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return ledgerData{}, err
+	}
+	return c, nil
+}
+
+// mutate 执行一次会改动台账的操作：先留存改动前数据的深拷贝，再执行 fn，
+// 最后写盘。只有写盘成功，修改才正式留在内存台账中；写盘失败时按深拷贝
+// 整体恢复——失败的记录既不进入文件，也不会残留在同一台账对象随后的查询、
+// 编号判重、最近证书与使用资格判断中。
+func (l *Ledger) mutate(fn func()) error {
+	prev, err := cloneData(l.data)
+	if err != nil {
+		return saveError(fmt.Sprintf("备份台账 %s 的当前内容: %v", l.path, err), err)
+	}
+	fn()
+	if err := l.save(); err != nil {
+		l.data = prev
+		return err
 	}
 	return nil
 }
@@ -275,8 +327,9 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 		Status:       StatusPending,
 		RegisteredAt: l.now().Format(time.RFC3339),
 	}
-	l.data.Instruments = append(l.data.Instruments, inst)
-	if err := l.save(); err != nil {
+	if err := l.mutate(func() {
+		l.data.Instruments = append(l.data.Instruments, inst)
+	}); err != nil {
 		return nil, err
 	}
 	return &inst, nil
@@ -296,8 +349,9 @@ func (l *Ledger) SetStatus(id string, status Status) error {
 	if inst.Status == status {
 		return nil
 	}
-	inst.Status = status
-	return l.save()
+	return l.mutate(func() {
+		inst.Status = status
+	})
 }
 
 // CertificateInput 是录入校准证书的输入。
@@ -313,6 +367,11 @@ type CertificateInput struct {
 
 // AddCertificate 录入一张校准证书并返回它；若同号证书且全部业务字段一致，
 // 返回原证书且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
+//
+// 业务校验通过但台账文件无法写入或替换时，返回保存错误（见 IsSaveError）：
+// 该证书不会进入内存台账，因此不占用证书编号与该器具当天的位置，同一台账
+// 对象随后的历史、最近证书与使用资格判断都与录入前一致；文件恢复可写后
+// 重新提交即作为新证书录入，无需关闭并重新打开台账。
 func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error) {
 	instID, err := cleanText(in.InstrumentID)
 	if err != nil {
@@ -391,8 +450,12 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 		Summary:      summary,
 		CreatedAt:    l.now().Format(time.RFC3339),
 	}
-	l.data.Certificates = append(l.data.Certificates, cert)
-	if err := l.save(); err != nil {
+	// 只有写盘成功后证书才进入内存台账：写盘失败时 mutate 会恢复数据，
+	// 失败证书不占用编号与该器具当天的位置，随后的查询、判重、最近证书
+	// 与使用资格判断都与本次录入前一致。
+	if err := l.mutate(func() {
+		l.data.Certificates = append(l.data.Certificates, cert)
+	}); err != nil {
 		return nil, false, err
 	}
 	return l.findCertificate(number), false, nil
@@ -523,8 +586,9 @@ func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
 	if rec.Reasons == nil {
 		rec.Reasons = []string{}
 	}
-	l.data.Usage = append(l.data.Usage, rec)
-	if err := l.save(); err != nil {
+	if err := l.mutate(func() {
+		l.data.Usage = append(l.data.Usage, rec)
+	}); err != nil {
 		return nil, err
 	}
 	return d, nil

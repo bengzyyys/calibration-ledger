@@ -3,6 +3,7 @@ package calibrate
 import (
 	"errors"
 	"math"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -540,6 +541,258 @@ func TestInvalidWritesLeaveNoHalfRecords(t *testing.T) {
 	if len(reopened.data.Certificates) != 0 || len(reopened.data.Usage) != 0 {
 		t.Fatalf("重开后发现半份记录：证书 %d 使用 %d",
 			len(reopened.data.Certificates), len(reopened.data.Usage))
+	}
+}
+
+// TestFailedCertSaveLeavesNoTrace 是本次修复的核心：已通过全部业务校验的新证书
+// 在台账文件无法写入或替换时必须明确返回保存错误，并且在内存台账中不留任何
+// 痕迹——不占用证书编号、不占用该器具当天的证书位置，查询结果与录入前一致。
+func TestFailedCertSaveLeavesNoTrace(t *testing.T) {
+	clock := &fakeClock{t: mustDate(t, "2026-10-02")}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.json")
+	l, err := openAt(path, clock.now)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mustRegister(t, l, "M-1", "万用表", 0.5)
+	mustRegister(t, l, "M-2", "示波器", 0.5)
+
+	// M-1 已有一张到期证书，M-2 已有一张超差证书：二者当前都不能使用。
+	mustAddCert(t, l, CertificateInput{
+		InstrumentID: "M-1", Number: "C-OLD", CalDate: "2025-01-01",
+		Expiry: "2025-12-31", Method: "m", Error: 0.1, Summary: "已到期",
+	})
+	mustAddCert(t, l, CertificateInput{
+		InstrumentID: "M-2", Number: "C-BAD", CalDate: "2026-09-01",
+		Expiry: "2027-09-01", Method: "m", Error: 5, Summary: "超差",
+	})
+	_ = l.SetStatus("M-1", StatusInUse)
+	_ = l.SetStatus("M-2", StatusInUse)
+	// 另备一台完全没有证书的在用器具。
+	mustRegister(t, l, "M-3", "频率计", 0.2)
+	_ = l.SetStatus("M-3", StatusInUse)
+
+	// 让目标目录不可写，使新证书的保存失败（测试以普通用户运行）。
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	in := CertificateInput{
+		InstrumentID: "M-1", Number: "C-NEW", CalDate: "2026-09-01",
+		Expiry: "2027-09-01", Method: "规范A", Error: 0.1, Summary: "合格新证",
+	}
+	cert, dup, err := l.AddCertificate(in)
+	if err == nil {
+		t.Fatal("台账不可写时应返回保存错误")
+	}
+	if !IsSaveError(err) {
+		t.Fatalf("应返回保存错误（IsSaveError），得到 %T: %v", err, err)
+	}
+	if cert != nil || dup {
+		t.Fatalf("保存失败不得返回证书或标记重复：cert=%v dup=%v", cert, dup)
+	}
+
+	// 同一台账对象继续查询：失败证书不得进入历史、不得成为最近证书。
+	if got := l.findCertificate("C-NEW"); got != nil {
+		t.Fatalf("失败证书残留在台账中：%+v", got)
+	}
+	if n := len(l.certificatesOf("M-1")); n != 1 {
+		t.Fatalf("M-1 历史证书应仍是录入前的 1 张，得到 %d", n)
+	}
+	if latest := l.LatestCertificate("M-1"); latest == nil || latest.Number != "C-OLD" {
+		t.Fatalf("最近证书应仍是 C-OLD，得到 %v", latest)
+	}
+
+	// 原来不能使用的器具不能被这张失败的合格证书解除限制。
+	r1, _ := l.Review("M-1")
+	if r1.CanUse || !containsReason(r1.Reasons, "到期") {
+		t.Fatalf("到期限制不应被失败证书解除：canUse=%v reasons=%v", r1.CanUse, r1.Reasons)
+	}
+	r2, _ := l.Review("M-2")
+	if r2.CanUse || !containsReason(r2.Reasons, "超差") {
+		t.Fatalf("超差限制不应被失败证书解除：canUse=%v reasons=%v", r2.CanUse, r2.Reasons)
+	}
+	r3, _ := l.Review("M-3")
+	if r3.CanUse || !containsReason(r3.Reasons, "没有校准证书") {
+		t.Fatalf("无证书器具仍应显示没有证书：reasons=%v", r3.Reasons)
+	}
+	if d, _ := l.CanUse("M-1"); d.Allowed {
+		t.Fatal("CanUse 不应被失败证书影响")
+	}
+
+	// 文件仍不可写时再次提交相同内容：应再次报告保存失败，
+	// 而不是以“重复证书”为由跳过保存返回成功。
+	cert2, dup2, err2 := l.AddCertificate(in)
+	if err2 == nil || !IsSaveError(err2) {
+		t.Fatalf("不可写时重复提交应再次报保存错误，cert=%v dup=%v err=%v", cert2, dup2, err2)
+	}
+
+	// 失败证书不占用该器具当天的证书位置：换个编号、同日提交，同样走到保存
+	// 并因不可写失败，而不是先被“同日已有证书”拒绝（那应是校验错误）。
+	otherDay := in
+	otherDay.Number = "C-SLOT"
+	if _, _, err := l.AddCertificate(otherDay); !IsSaveError(err) {
+		t.Fatalf("失败证书不应占用当天位置，另一同日证书应继续尝试保存而非被业务拒绝：%v", err)
+	}
+
+	// 恢复可写：不必重开台账，重新提交应作为新证书正常录入。
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("restore chmod: %v", err)
+	}
+	saved, dup3, err := l.AddCertificate(in)
+	if err != nil || dup3 {
+		t.Fatalf("恢复可写后应作为新证书录入，dup=%v err=%v", dup3, err)
+	}
+	if saved == nil || saved.Number != "C-NEW" {
+		t.Fatalf("应返回保存成功的新证书，得到 %v", saved)
+	}
+	if n := len(l.certificatesOf("M-1")); n != 2 {
+		t.Fatalf("保存成功后历史应为 2 张，得到 %d", n)
+	}
+	// 成功录入后才参与最近证书与使用资格判断：合格未到期证书解除到期限制。
+	r1, _ = l.Review("M-1")
+	if !r1.CanUse || r1.Latest == nil || r1.Latest.Number != "C-NEW" {
+		t.Fatalf("成功录入后 M-1 应可使用且最近证书为 C-NEW：%+v", r1)
+	}
+
+	// 成功保存的证书仍遵守原幂等规则：同号同内容返回原证书，不增加历史。
+	again, idem, err := l.AddCertificate(in)
+	if err != nil || !idem || again.Number != "C-NEW" {
+		t.Fatalf("成功证书的同号同内容提交应幂等返回，idem=%v err=%v", idem, err)
+	}
+	if n := len(l.certificatesOf("M-1")); n != 2 {
+		t.Fatalf("幂等提交不应增加历史，得到 %d 张", n)
+	}
+}
+
+// TestFailedCertNotCarriedByLaterSuccessfulSave 验证写盘恢复后，即使先执行了
+// 其他能够成功保存的正常操作，先前失败的证书也不会被顺带写入台账。
+func TestFailedCertNotCarriedByLaterSuccessfulSave(t *testing.T) {
+	clock := &fakeClock{t: mustDate(t, "2026-10-02")}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.json")
+	l, err := openAt(path, clock.now)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mustRegister(t, l, "M-1", "万用表", 0.5)
+
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	in := CertificateInput{
+		InstrumentID: "M-1", Number: "C-FAIL", CalDate: "2026-09-01",
+		Expiry: "2027-09-01", Method: "m", Error: 0.1, Summary: "s",
+	}
+	if _, _, err := l.AddCertificate(in); !IsSaveError(err) {
+		t.Fatalf("不可写时应报保存错误：%v", err)
+	}
+
+	// 恢复可写后先做另一项正常操作（切换状态）并成功保存；
+	// 失败证书绝不能随这次写盘进入文件。
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("restore chmod: %v", err)
+	}
+	if err := l.SetStatus("M-1", StatusInUse); err != nil {
+		t.Fatalf("恢复后的正常操作应成功：%v", err)
+	}
+	if l.findCertificate("C-FAIL") != nil {
+		t.Fatal("失败证书被后续成功操作顺带写入了内存台账")
+	}
+	reopened, err := openAt(path, clock.now)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if reopened.findCertificate("C-FAIL") != nil {
+		t.Fatal("失败证书被后续成功操作顺带写入了台账文件")
+	}
+	if len(reopened.data.Certificates) != 0 {
+		t.Fatalf("台账文件不应包含任何证书，得到 %d", len(reopened.data.Certificates))
+	}
+
+	// 重新提交相同内容应作为新证书录入，而非被判为重复。
+	saved, dup, err := l.AddCertificate(in)
+	if err != nil || dup || saved == nil {
+		t.Fatalf("重新提交应作为新证书录入：saved=%v dup=%v err=%v", saved, dup, err)
+	}
+}
+
+// TestOtherMutatorsRollbackOnSaveFailure 验证其他改动类操作在写盘失败时
+// 同样回滚内存状态，失败操作不留下任何可被后续查询看到的痕迹。
+func TestOtherMutatorsRollbackOnSaveFailure(t *testing.T) {
+	clock := &fakeClock{t: mustDate(t, "2026-10-02")}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ledger.json")
+	l, err := openAt(path, clock.now)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	mustRegister(t, l, "M-1", "万用表", 0.5)
+	mustAddCert(t, l, CertificateInput{
+		InstrumentID: "M-1", Number: "C-1", CalDate: "2026-01-01",
+		Expiry: "2027-01-01", Method: "m", Error: 0, Summary: "s",
+	})
+
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	// 新器具登记失败：同一对象与文件中都不应出现它。
+	if _, err := l.Register(RegisterInput{ID: "M-GHOST", Name: "幽灵", AllowedError: 1}); !IsSaveError(err) {
+		t.Fatalf("登记保存失败应报保存错误：%v", err)
+	}
+	if l.findInstrument("M-GHOST") != nil {
+		t.Fatal("保存失败的器具残留在内存台账中")
+	}
+	// 状态切换失败：内存状态保持不变。
+	if err := l.SetStatus("M-1", StatusInUse); !IsSaveError(err) {
+		t.Fatalf("状态切换保存失败应报保存错误：%v", err)
+	}
+	if got := l.findInstrument("M-1"); got.Status != StatusPending {
+		t.Fatalf("失败的状态切换残留：%s", got.Status)
+	}
+	// 使用申请失败：不留痕，即使申请本应被允许也不返回决策成功。
+	if _, err := l.RequestUse("M-1"); !IsSaveError(err) {
+		t.Fatalf("使用申请保存失败应报保存错误：%v", err)
+	}
+	if n := len(l.UsageRecords()); n != 0 {
+		t.Fatalf("失败的使用申请留下了留痕：%d 条", n)
+	}
+	// 计划建立失败：不占用计划编号，也不产生未结束计划。
+	if _, err := l.CreatePlan(PlanInput{
+		Number: "PL-GHOST", InstrumentID: "M-1", Date: "2026-10-20", Note: "n",
+	}); !IsSaveError(err) {
+		t.Fatalf("建计划保存失败应报保存错误：%v", err)
+	}
+	if l.findPlan("PL-GHOST") != nil {
+		t.Fatal("保存失败的计划残留在内存台账中")
+	}
+
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("restore chmod: %v", err)
+	}
+	reopened, err := openAt(path, clock.now)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if reopened.findInstrument("M-GHOST") != nil ||
+		reopened.findInstrument("M-1").Status != StatusPending ||
+		len(reopened.data.Usage) != 0 ||
+		reopened.findPlan("PL-GHOST") != nil {
+		t.Fatalf("文件中出现了失败操作的残留：%+v", reopened.data)
+	}
+	// 恢复后原编号仍可正常使用（失败操作没有占用编号）。
+	if _, err := l.Register(RegisterInput{ID: "M-GHOST", Name: "幽灵", AllowedError: 1}); err != nil {
+		t.Fatalf("恢复后应能登记此前失败的器具编号：%v", err)
+	}
+	if _, err := l.CreatePlan(PlanInput{
+		Number: "PL-GHOST", InstrumentID: "M-1", Date: "2026-10-20", Note: "n",
+	}); err != nil {
+		t.Fatalf("恢复后应能建立此前失败的计划编号：%v", err)
 	}
 }
 
