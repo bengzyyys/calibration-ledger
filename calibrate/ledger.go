@@ -467,12 +467,17 @@ type UsageDecision struct {
 // evaluate 按器具状态与“最近证书”判定当前能否使用，并列出全部适用原因。
 // 最近证书超差或到期时不会回退到更早的合格证书。
 func (l *Ledger) evaluate(id string) (*Instrument, *UsageDecision) {
-	today := l.now()
+	return l.evaluateAt(id, l.now())
+}
+
+// evaluateAt 与 evaluate 相同，但全部判断都使用调用方给定的同一时刻，
+// 供按器具核对这类需要整份结果共用同一本机日期的入口使用。
+func (l *Ledger) evaluateAt(id string, now time.Time) (*Instrument, *UsageDecision) {
 	inst := l.findInstrument(id)
 	if inst == nil {
 		return nil, nil
 	}
-	d := &UsageDecision{InstrumentID: id, evaluatedAt: today}
+	d := &UsageDecision{InstrumentID: id, evaluatedAt: now}
 	if inst.Status != StatusInUse {
 		d.Reasons = append(d.Reasons, fmt.Sprintf("器具当前状态为%s，只有在用器具可以申请使用", inst.Status))
 	}
@@ -480,7 +485,7 @@ func (l *Ledger) evaluate(id string) (*Instrument, *UsageDecision) {
 	if latest == nil {
 		d.Reasons = append(d.Reasons, "没有校准证书")
 	} else {
-		v := viewCertificate(*latest, inst.AllowedError, today)
+		v := viewCertificate(*latest, inst.AllowedError, now)
 		d.Latest = &v
 		if !v.Pass {
 			d.Reasons = append(d.Reasons, fmt.Sprintf(
@@ -557,8 +562,14 @@ type InstrumentReview struct {
 // Review 按器具核对：登记信息、当前能否使用及原因、最近证书与到期日、
 // 全部历史证书、被拒绝的使用记录以及该器具当前与已结束的校准计划。
 // 历史拒绝原因按申请当时的冻结内容展示，不随后来补录证书或切换状态而改变。
+//
+// 整份结果以本次核对开始时的本机日历日期为准：能否使用及原因、最近证书与
+// 历史证书的到期判断、未结束计划的“今天需校准/逾期/未到计划日”标记都使用
+// 同一个日期，即使查询过程中跨过午夜也不会出现前后两部分各自属于不同日期。
+// 每次调用都重新取当时的本机日期，不沿用上一次核对的结果。
 func (l *Ledger) Review(id string) (*InstrumentReview, error) {
-	inst, d := l.evaluate(id)
+	now := l.now()
+	inst, d := l.evaluateAt(id, now)
 	if inst == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
 	}
@@ -571,9 +582,8 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	if r.Reasons == nil {
 		r.Reasons = []string{}
 	}
-	today := l.now()
 	for _, c := range l.certificatesOf(id) {
-		r.History = append(r.History, viewCertificate(c, inst.AllowedError, today))
+		r.History = append(r.History, viewCertificate(c, inst.AllowedError, now))
 	}
 	for _, u := range l.data.Usage {
 		if u.InstrumentID == id && !u.Allowed {
@@ -583,7 +593,7 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 			r.Rejections = append(r.Rejections, u)
 		}
 	}
-	r.Plans = l.planViews(id, today)
+	r.Plans = l.planViews(id, now)
 	return r, nil
 }
 
