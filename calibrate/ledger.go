@@ -313,6 +313,11 @@ type CertificateInput struct {
 
 // AddCertificate 录入一张校准证书并返回它；若同号证书且全部业务字段一致，
 // 返回原证书且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
+//
+// 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
+// 台账（含同一对象随后的查询）与录入前完全一致——失败的证书既不进入历史、
+// 不占用证书编号或该器具当天的位置，也不会在此后其他成功操作写盘时被顺带写入；
+// 恢复可写后重新提交同号同内容会作为新证书正常录入。
 func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error) {
 	instID, err := cleanText(in.InstrumentID)
 	if err != nil {
@@ -391,8 +396,16 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 		Summary:      summary,
 		CreatedAt:    l.now().Format(time.RFC3339),
 	}
-	l.data.Certificates = append(l.data.Certificates, cert)
+	// 在独立的新切片上暂存新证书：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片，保证同一台账对象随后看到的历史、最近证书、
+	// 证书编号占用与同日位置都与录入前一致，且不会被之后的写盘顺带写入。
+	original := l.data.Certificates
+	staged := make([]Certificate, 0, len(original)+1)
+	staged = append(staged, original...)
+	staged = append(staged, cert)
+	l.data.Certificates = staged
 	if err := l.save(); err != nil {
+		l.data.Certificates = original
 		return nil, false, err
 	}
 	return l.findCertificate(number), false, nil
