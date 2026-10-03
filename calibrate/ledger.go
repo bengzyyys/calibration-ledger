@@ -464,10 +464,11 @@ type UsageDecision struct {
 	evaluatedAt  time.Time
 }
 
-// evaluate 按器具状态与“最近证书”判定当前能否使用，并列出全部适用原因。
-// 最近证书超差或到期时不会回退到更早的合格证书。
-func (l *Ledger) evaluate(id string) (*Instrument, *UsageDecision) {
-	today := l.now()
+// evaluateAt 按器具状态与“最近证书”判定 now 所在本机日历日期能否使用，
+// 并列出全部适用原因。最近证书超差或到期时不会回退到更早的合格证书。
+// 同一次核对的各部分必须共用同一个 now，避免跨午夜时判断不一致。
+func (l *Ledger) evaluateAt(id string, now time.Time) (*Instrument, *UsageDecision) {
+	today := now
 	inst := l.findInstrument(id)
 	if inst == nil {
 		return nil, nil
@@ -498,7 +499,7 @@ func (l *Ledger) evaluate(id string) (*Instrument, *UsageDecision) {
 
 // CanUse 只按当前数据评估能否使用，不留存申请记录。
 func (l *Ledger) CanUse(id string) (*UsageDecision, error) {
-	inst, d := l.evaluate(id)
+	inst, d := l.evaluateAt(id, l.now())
 	if inst == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
 	}
@@ -521,7 +522,7 @@ func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, fmt.Errorf("器具编号无效：%w", validationError("不能留空或只有空白"))
 	}
-	inst, d := l.evaluate(id)
+	inst, d := l.evaluateAt(id, l.now())
 	if inst == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
 	}
@@ -556,9 +557,14 @@ type InstrumentReview struct {
 
 // Review 按器具核对：登记信息、当前能否使用及原因、最近证书与到期日、
 // 全部历史证书、被拒绝的使用记录以及该器具当前与已结束的校准计划。
-// 历史拒绝原因按申请当时的冻结内容展示，不随后来补录证书或切换状态而改变。
+// 整份核对只采用核对开始时的一次本机日期：即使查询结束前跨过午夜，
+// 能否使用、最近证书、历史证书到期判断与未结束计划标记也不会各自变成新一天。
+// 历史拒绝原因按申请当时的冻结内容展示，不随本次采用的日期重新计算。
 func (l *Ledger) Review(id string) (*InstrumentReview, error) {
-	inst, d := l.evaluate(id)
+	// 本次核对只在开始时取一次本机时间，整份结果共用，跨午夜不分裂判断；
+	// 下一次核对会重新取当时的本机日期，不沿用本次结果。
+	now := l.now()
+	inst, d := l.evaluateAt(id, now)
 	if inst == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
 	}
@@ -571,7 +577,7 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	if r.Reasons == nil {
 		r.Reasons = []string{}
 	}
-	today := l.now()
+	today := now
 	for _, c := range l.certificatesOf(id) {
 		r.History = append(r.History, viewCertificate(c, inst.AllowedError, today))
 	}
