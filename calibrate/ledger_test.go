@@ -462,6 +462,80 @@ func TestReviewFreezesHistoricalReasons(t *testing.T) {
 	}
 }
 
+func TestReturnedUsageDataCannotRewriteHistory(t *testing.T) {
+	clock := &fakeClock{t: mustDate(t, "2026-10-02")}
+	l := newTestLedger(t, clock)
+	mustRegister(t, l, "M-1", "万用表", 0.5)
+
+	// 待校准且无证书：拒绝并留痕，含状态与证书两条原因。
+	d, err := l.RequestUse("M-1")
+	if err != nil {
+		t.Fatalf("RequestUse: %v", err)
+	}
+	if d.Allowed || len(d.Reasons) != 2 {
+		t.Fatalf("应拒绝并记录两条原因，得到 allowed=%v reasons=%v", d.Allowed, d.Reasons)
+	}
+	frozen := append([]string(nil), d.Reasons...)
+
+	// 调用方改写返回结果中的原因：替换、删减、补充。
+	d.Reasons[0] = "展示用短句"
+	d.Reasons = append(d.Reasons[:1], "调用方补充的原因")
+
+	// 再次读取全部使用记录与按器具核对，仍应看到原申请时的完整原因。
+	recs := l.UsageRecords()
+	if len(recs) != 1 || !sameReasons(recs[0].Reasons, frozen) {
+		t.Fatalf("UsageRecords 历史被改写：保存=%v 现在=%v", frozen, recs)
+	}
+	r, _ := l.Review("M-1")
+	if len(r.Rejections) != 1 || !sameReasons(r.Rejections[0].Reasons, frozen) {
+		t.Fatalf("Review 历史被改写：保存=%v 现在=%v", frozen, r.Rejections)
+	}
+
+	// 分别取得的两份结果互不影响：整理其中一份，另一份不变。
+	recs[0].Reasons[0] = "又被改了"
+	r.Rejections[0].Reasons[1] = "核对里改了"
+	recs2 := l.UsageRecords()
+	r2, _ := l.Review("M-1")
+	if !sameReasons(recs2[0].Reasons, frozen) || !sameReasons(r2.Rejections[0].Reasons, frozen) {
+		t.Fatalf("返回结果之间互相影响：recs=%v review=%v", recs2[0].Reasons, r2.Rejections[0].Reasons)
+	}
+
+	// 补录合格证书并切换在用：当前核对允许使用，历史拒绝仍保留原原因。
+	_ = l.SetStatus("M-1", StatusInUse)
+	mustAddCert(t, l, CertificateInput{
+		InstrumentID: "M-1", Number: "C-1", CalDate: "2026-09-01",
+		Expiry: "2027-09-01", Method: "m", Error: 0, Summary: "s",
+	})
+	r, _ = l.Review("M-1")
+	if !r.CanUse {
+		t.Fatalf("补录合格证书并在用后应可使用，得到 %v", r.Reasons)
+	}
+	if len(r.Rejections) != 1 || !sameReasons(r.Rejections[0].Reasons, frozen) {
+		t.Fatalf("补录证书后历史拒绝原因被改写：保存=%v 现在=%v", frozen, r.Rejections[0].Reasons)
+	}
+
+	// 正常操作保存台账后，从同一文件读出的历史仍保持原样。
+	l2, err := openAt(l.Path(), clock.now)
+	if err != nil {
+		t.Fatalf("重新打开台账: %v", err)
+	}
+	recs = l2.UsageRecords()
+	if len(recs) != 1 || !sameReasons(recs[0].Reasons, frozen) {
+		t.Fatalf("保存后文件中的历史被改写：保存=%v 读出=%v", frozen, recs)
+	}
+
+	// 允许使用的申请原因仍为空；调用方自行添加原因不会变成历史拒绝。
+	d, err = l2.RequestUse("M-1")
+	if err != nil || !d.Allowed {
+		t.Fatalf("应允许使用：%v %v", err, d)
+	}
+	d.Reasons = append(d.Reasons, "调用方自行添加")
+	r, _ = l2.Review("M-1")
+	if len(r.Rejections) != 1 {
+		t.Fatalf("允许使用的申请不应成为历史拒绝，得到 %d 条", len(r.Rejections))
+	}
+}
+
 func TestPersistenceAndLedgerIsolation(t *testing.T) {
 	dir := t.TempDir()
 	pathA := filepath.Join(dir, "a.json")

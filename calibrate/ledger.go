@@ -492,6 +492,22 @@ func (l *Ledger) CanUse(id string) (*UsageDecision, error) {
 	return d, nil
 }
 
+// cloneStrings 复制字符串切片。返回给调用方的数据必须与台账内部存储
+// 互不影响：调用方整理返回内容不能改写已留痕的历史记录。
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
+
+// cloneUsageRecord 复制一条使用记录，原因切片一并深拷贝。
+func cloneUsageRecord(u UsageRecord) UsageRecord {
+	out := u
+	out.Reasons = cloneStrings(u.Reasons)
+	return out
+}
+
 // RequestUse 针对已有器具提交使用申请：无论允许或拒绝都保存申请时间、结果
 // 与当时全部原因。未知编号报错且不新增记录。
 func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
@@ -506,7 +522,9 @@ func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
 		InstrumentID: id,
 		RequestedAt:  d.evaluatedAt.Format(time.RFC3339),
 		Allowed:      d.Allowed,
-		Reasons:      d.Reasons,
+		// 留痕的原因在申请时冻结：保存独立副本，调用方随后修改返回的
+		// UsageDecision.Reasons 不会改写已记录的历史。
+		Reasons: cloneStrings(d.Reasons),
 	}
 	if rec.Reasons == nil {
 		rec.Reasons = []string{}
@@ -552,7 +570,8 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	}
 	for _, u := range l.data.Usage {
 		if u.InstrumentID == id && !u.Allowed {
-			r.Rejections = append(r.Rejections, u)
+			// 深拷贝原因：调用方整理核对结果不能改写台账中的历史记录。
+			r.Rejections = append(r.Rejections, cloneUsageRecord(u))
 		}
 	}
 	r.Plans = l.planViews(id, today)
@@ -566,9 +585,13 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// UsageRecords 返回全部使用申请记录，按申请时间排序。
+// UsageRecords 返回全部使用申请记录，按申请时间排序。返回的是深拷贝，
+// 调用方修改其中的原因不会影响台账中已留痕的历史。
 func (l *Ledger) UsageRecords() []UsageRecord {
-	out := append([]UsageRecord(nil), l.data.Usage...)
+	var out []UsageRecord
+	for _, u := range l.data.Usage {
+		out = append(out, cloneUsageRecord(u))
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].RequestedAt != out[j].RequestedAt {
 			return out[i].RequestedAt < out[j].RequestedAt
