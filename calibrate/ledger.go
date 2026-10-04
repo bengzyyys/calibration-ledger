@@ -283,6 +283,14 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 }
 
 // SetStatus 切换器具状态。切换为在用不代表已校准；停用不删除证书与使用记录。
+//
+// 目标状态合法且与最后成功保存的状态不同后才写盘：若台账文件无法写入或替换，
+// 明确返回保存错误，台账（含同一对象随后的列出、按器具核对、待办与使用判断）
+// 与切换前完全一致——器具仍保持最后成功保存的状态，失败的目标状态既不会提前
+// 参与使用资格判断，也不会在此后其他成功操作写盘时被顺带写入；文件仍不可写时
+// 再次提交同一目标状态仍报保存错误（不会因内存已被改成目标状态而被当成
+// “状态未变”跳过保存返回成功）。恢复可写后无需重新打开台账，重新提交且保存
+// 成功，新状态才生效。请求状态本来就等于最后成功保存的状态时直接成功，不写盘。
 func (l *Ledger) SetStatus(id string, status Status) error {
 	switch status {
 	case StatusInUse, StatusRetired, StatusPending:
@@ -296,8 +304,25 @@ func (l *Ledger) SetStatus(id string, status Status) error {
 	if inst.Status == status {
 		return nil
 	}
-	inst.Status = status
-	return l.save()
+	// 在整份器具切片的独立副本上暂存新状态：只有原子替换台账文件成功后才
+	// 提交。写盘失败时恢复原切片，保证同一台账对象随后看到的器具状态、列出
+	// 结果、待办与使用判断都与切换前一致；再次提交相同状态仍会走到保存，
+	// 失败状态也不会被之后的写盘顺带写入。
+	original := l.data.Instruments
+	staged := make([]Instrument, len(original))
+	copy(staged, original)
+	for i := range staged {
+		if staged[i].ID == id {
+			staged[i].Status = status
+			break
+		}
+	}
+	l.data.Instruments = staged
+	if err := l.save(); err != nil {
+		l.data.Instruments = original
+		return err
+	}
+	return nil
 }
 
 // CertificateInput 是录入校准证书的输入。
