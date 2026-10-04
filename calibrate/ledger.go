@@ -551,8 +551,17 @@ func cloneReasons(in []string) []string {
 	return append([]string(nil), in...)
 }
 
-// RequestUse 针对已有器具提交使用申请：无论允许或拒绝都保存申请时间、结果
-// 与当时全部原因。未知编号报错且不新增记录。
+// RequestUse 针对已有器具提交使用申请：无论允许或拒绝，都只有在本次记录
+// 保存成功后才算提交完成，保存申请时间、结果与当时全部原因。未知编号报错
+// 且不新增记录。
+//
+// 评估通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，不返回
+// 已提交成功的使用结果——台账（含同一对象随后的全部使用记录与按器具核对
+// 中的被拒绝记录）与申请前完全一致，本次失败的申请时间、允许结果与拒绝
+// 原因不进入历史，也不会在此后其他成功操作写盘时被顺带写入；器具登记信息、
+// 证书与校准计划不因这次失败发生变化。文件仍不可写时再次申请仍报保存错误；
+// 恢复可写后无需重新打开台账，重新申请且保存成功才新增一条按当时实际情况
+// 判断的记录。
 func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
 	if strings.TrimSpace(id) == "" {
 		return nil, fmt.Errorf("器具编号无效：%w", validationError("不能留空或只有空白"))
@@ -572,8 +581,16 @@ func (l *Ledger) RequestUse(id string) (*UsageDecision, error) {
 	if rec.Reasons == nil {
 		rec.Reasons = []string{}
 	}
-	l.data.Usage = append(l.data.Usage, rec)
+	// 在独立的新切片上暂存本次申请记录：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片，保证同一台账对象随后看到的使用记录与申请前一致，
+	// 失败的申请也不会被之后的写盘顺带写入。
+	original := l.data.Usage
+	staged := make([]UsageRecord, 0, len(original)+1)
+	staged = append(staged, original...)
+	staged = append(staged, rec)
+	l.data.Usage = staged
 	if err := l.save(); err != nil {
+		l.data.Usage = original
 		return nil, err
 	}
 	return d, nil
