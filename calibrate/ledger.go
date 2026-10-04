@@ -337,7 +337,13 @@ type CertificateInput struct {
 }
 
 // AddCertificate 录入一张校准证书并返回它；若同号证书且全部业务字段一致，
-// 返回原证书且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
+// 返回原证书内容且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
+//
+// 返回的证书只是本次已保存内容的独立副本：调用方随后修改返回结果中的编号、
+// 器具、校准日期、截止日、方法、摘要或误差，都只影响自己那份展示数据，不会
+// 回写台账，不改变最近证书选择、到期与超差结论、编号占用或证书归属，也不会
+// 在此后其他正常操作写盘时被带入证书历史。先后取得的两份返回结果（含同号同
+// 内容的幂等提交）各自独立；再次查询、核对得到的仍是正式保存的内容。
 //
 // 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
 // 台账（含同一对象随后的查询）与录入前完全一致——失败的证书既不进入历史、
@@ -397,8 +403,11 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 			return nil, false, &ConflictError{Msg: fmt.Sprintf(
 				"证书编号 %s 已存在且内容不同，拒绝覆盖已有数据", number)}
 		}
-		// 同号且全部业务字段一致：返回原证书，不增加历史记录。
-		return existing, true, nil
+		// 同号且全部业务字段一致：返回原证书内容的独立副本，不增加历史记录。
+		// 返回副本与台账内部存储及其他返回结果都不共享，调用方的整理不能
+		// 借此改写正式证书。
+		saved := *existing
+		return &saved, true, nil
 	}
 
 	// 同一器具同一天不接受两张不同编号的证书。
@@ -433,7 +442,10 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 		l.data.Certificates = original
 		return nil, false, err
 	}
-	return l.findCertificate(number), false, nil
+	// 返回已保存证书的独立副本，与台账内部存储不共享：调用方整理返回
+	// 结果只能改动自己的展示数据，不能成为修改正式证书的另一条途径。
+	saved := *l.findCertificate(number)
+	return &saved, false, nil
 }
 
 // certificatesOf 返回某器具的证书，按校准日期从新到旧排序；日期相同时
