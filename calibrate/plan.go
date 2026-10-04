@@ -69,6 +69,17 @@ func (l *Ledger) findPlan(number string) *Plan {
 	return nil
 }
 
+// clonePlan 返回计划的独立副本（含整条改期历史）：对外返回的计划只是
+// 展示副本，调用方整理编号、日期、状态、关联证书或任何一条改期记录，
+// 都不会改写台账内的正式计划，也不会被此后的写盘带入文件。
+// Changes 为 nil 时保持 nil，维持没有改期历史时的既有表现。
+func clonePlan(p Plan) Plan {
+	if p.Changes != nil {
+		p.Changes = append([]PlanChange(nil), p.Changes...)
+	}
+	return p
+}
+
 // validatePlanDate 解析 YYYY-MM-DD 真实日期，且不得早于本机今天。
 func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
 	_, text, err := parseFiniteDate(raw, field)
@@ -86,6 +97,10 @@ func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
 // 已结束计划也不能复用），计划日期须真实存在且不早于本机今天，说明非空；
 // 每件器具最多有一项未完成、未取消的计划。任一条件不满足都明确拒绝，
 // 不新增或改动任何记录。
+//
+// 返回的计划只是本次已保存内容的展示副本，与台账内存储不共享内存：调用方
+// 整理返回结果不会改写正式计划、不占用或释放计划编号，也不会被此后的写盘
+// 带入文件；重新查询得到的仍是实际保存的内容。
 func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 	number, err := cleanText(in.Number)
 	if err != nil {
@@ -130,7 +145,9 @@ func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 	if err := l.save(); err != nil {
 		return nil, err
 	}
-	return l.findPlan(number), nil
+	// 返回已保存计划的独立副本：返回结果只表示本次保存的内容。
+	saved := clonePlan(*l.findPlan(number))
+	return &saved, nil
 }
 
 // requireOpenPlan 找到计划并确认其尚未结束；已结束计划返回明确的校验错误。
@@ -197,7 +214,10 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 		l.data.Plans = original
 		return nil, err
 	}
-	return l.findPlan(number), nil
+	// 返回已保存计划的独立副本（含改期历史）：调用方整理返回的日期、状态
+	// 或任何一条改期记录，都不会改写台账内的正式计划。
+	saved := clonePlan(*l.findPlan(number))
+	return &saved, nil
 }
 
 // CancelPlan 取消一项未结束的计划，原因必须非空。取消后保留原计划、取消时间
@@ -242,7 +262,10 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 		l.data.Plans = original
 		return nil, err
 	}
-	return l.findPlan(number), nil
+	// 返回已保存计划的独立副本：调用方整理返回的状态、取消时间或原因，
+	// 都不会改写台账内的正式计划。
+	saved := clonePlan(*l.findPlan(number))
+	return &saved, nil
 }
 
 // CompletePlan 用一张台账中已有的证书完成计划。证书必须属于该器具，校准日期
@@ -260,6 +283,10 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 // 再次用同一证书完成同一已保存为完成的计划返回原结果，不增加记录或刷新
 // 完成时间；已完成计划改用另一证书、证书不存在或不符合条件、完成已取消
 // 计划均拒绝。
+//
+// 两条路径返回的计划都只是展示副本，与台账内存储不共享内存：调用方整理
+// 返回的状态、完成时间或关联证书编号，不会改写正式计划，不影响该证书
+// 已用于完成本计划的判断，也不会被此后的写盘带入文件。
 func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, error) {
 	number, err := cleanText(number)
 	if err != nil {
@@ -276,7 +303,9 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 	// 幂等：同一证书再次完成同一计划，返回原结果，不刷新完成时间。
 	if p.Status == PlanStatusDone {
 		if p.CertificateNumber == certificateNumber {
-			return p, true, nil
+			// 返回独立副本：调用方整理原结果不影响台账内的正式计划。
+			dup := clonePlan(*p)
+			return &dup, true, nil
 		}
 		return nil, false, validationError(
 			"计划 %s 已用证书 %s 完成，已完成计划不能改用另一证书",
@@ -339,7 +368,10 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 		l.data.Plans = original
 		return nil, false, err
 	}
-	return l.findPlan(number), false, nil
+	// 返回已保存计划的独立副本：调用方整理返回的状态、完成时间或关联证书
+	// 编号，都不会改写台账内的正式计划，也不影响证书占用判断。
+	saved := clonePlan(*l.findPlan(number))
+	return &saved, false, nil
 }
 
 // TodoItem 是待办查询中的一项计划及其按本机日期重新判断的标记。
@@ -414,11 +446,13 @@ type PlanView struct {
 }
 
 // plansOf 返回某器具的全部计划（含已结束），按建立先后排列。
+// 返回的是展示副本（含改期历史的独立拷贝）：调用方调整顺序、删改记录或
+// 整理任何一条改期内容，都不会改写台账内的正式计划。
 func (l *Ledger) plansOf(id string) []Plan {
 	var out []Plan
 	for _, p := range l.data.Plans {
 		if p.InstrumentID == id {
-			out = append(out, p)
+			out = append(out, clonePlan(p))
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
