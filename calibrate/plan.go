@@ -149,6 +149,12 @@ func (l *Ledger) requireOpenPlan(number string) (*Plan, error) {
 // ReschedulePlan 改期一项未结束的计划。原因必须非空，新日期必须真实存在且
 // 不早于操作当天；每次改期保留修改前后的日期、操作时间和原因。
 // 找不到计划或计划已结束时拒绝且不改动记录。
+//
+// 业务校验全部通过后才写盘：改期只在台账文件原子替换成功后生效。写盘失败时
+// 明确返回保存错误，当前计划日期与改期历史保持改期前状态——同一台账对象随后
+// 的按器具核对、计划查询与待办标记仍以最后成功保存的日期为准，失败申请的原因
+// 和时间不进入历史，也不会被之后其他成功保存的操作顺带写入；恢复可写后无需
+// 重新打开台账，重新提交合法改期才生效，新增记录从最后成功保存的日期起算。
 func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 	number, err := cleanText(number)
 	if err != nil {
@@ -162,22 +168,35 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, err := l.requireOpenPlan(number)
-	if err != nil {
+	if _, err = l.requireOpenPlan(number); err != nil {
 		return nil, err
 	}
-	// 即使新日期与当前日期相同也照常记录：保留修改前后的日期、操作时间和原因。
-	p.Changes = append(p.Changes, PlanChange{
-		From:      p.PlannedDate,
-		To:        dateText,
-		ChangedAt: l.now().Format(time.RFC3339),
-		Reason:    reason,
-	})
-	p.PlannedDate = dateText
+	// 在计划副本上暂存改期：即使新日期与当前日期相同也照常记录，保留修改
+	// 前后的日期、操作时间和原因。整个 Plans 切片复制一份再替换目标计划，
+	// 目标计划的改期历史也复制到全新切片，绝不就地加长原切片。暂存副本先
+	// 装入 l.data 供 save() 序列化；只有原子替换台账文件成功才提交，写盘
+	// 失败时恢复原切片——原计划的当前日期与历史一条不变，失败改期也不会
+	// 滞留内存被之后的写盘顺带写入。
+	originalPlans := l.data.Plans
+	stagedPlans := append([]Plan(nil), originalPlans...)
+	for i := range stagedPlans {
+		if stagedPlans[i].Number != number {
+			continue
+		}
+		stagedPlans[i].Changes = append(append([]PlanChange(nil), stagedPlans[i].Changes...), PlanChange{
+			From:      stagedPlans[i].PlannedDate,
+			To:        dateText,
+			ChangedAt: l.now().Format(time.RFC3339),
+			Reason:    reason,
+		})
+		stagedPlans[i].PlannedDate = dateText
+	}
+	l.data.Plans = stagedPlans
 	if err := l.save(); err != nil {
+		l.data.Plans = originalPlans
 		return nil, err
 	}
-	return p, nil
+	return l.findPlan(number), nil
 }
 
 // CancelPlan 取消一项未结束的计划，原因必须非空。取消后保留原计划、取消时间
