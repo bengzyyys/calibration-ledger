@@ -283,6 +283,13 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 }
 
 // SetStatus 切换器具状态。切换为在用不代表已校准；停用不删除证书与使用记录。
+//
+// 目标状态合法且与当前状态不同时才写盘：若台账文件无法写入或替换，明确返回
+// 保存错误，台账（含同一对象随后的列表、按器具核对与使用判断）保持最后成功
+// 保存的状态——失败的目标状态既不生效，也不会被此后其他成功操作写盘时顺带
+// 写入；文件仍不可写时再次提交同一目标状态仍报保存错误，恢复可写后无需重新
+// 打开台账，重新提交并成功保存才生效。目标状态与当前状态相同则直接返回成功，
+// 不额外写盘。
 func (l *Ledger) SetStatus(id string, status Status) error {
 	switch status {
 	case StatusInUse, StatusRetired, StatusPending:
@@ -296,8 +303,16 @@ func (l *Ledger) SetStatus(id string, status Status) error {
 	if inst.Status == status {
 		return nil
 	}
+	// 先暂存新状态再写盘：只有原子替换台账文件成功后才算生效。
+	// 写盘失败时恢复最后成功保存的状态，保证同一台账对象随后的列表、
+	// 核对与使用判断都按原状态执行，失败状态也不会被之后的写盘顺带写入。
+	previous := inst.Status
 	inst.Status = status
-	return l.save()
+	if err := l.save(); err != nil {
+		inst.Status = previous
+		return err
+	}
+	return nil
 }
 
 // CertificateInput 是录入校准证书的输入。
