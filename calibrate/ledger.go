@@ -339,6 +339,11 @@ type CertificateInput struct {
 // AddCertificate 录入一张校准证书并返回它；若同号证书且全部业务字段一致，
 // 返回原证书且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
 //
+// 返回的证书只是本次已保存内容的展示副本，与台账内存储不共享内存：调用方
+// 整理返回结果中的误差、截止日、编号或其他字段，不会改写台账里的正式证书，
+// 不影响最近证书的选择、使用资格判断与编号占用，也不会被此后的写盘带入文件；
+// 重新查询得到的仍是实际保存的内容。
+//
 // 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
 // 台账（含同一对象随后的查询）与录入前完全一致——失败的证书既不进入历史、
 // 不占用证书编号或该器具当天的位置，也不会在此后其他成功操作写盘时被顺带写入；
@@ -398,7 +403,9 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 				"证书编号 %s 已存在且内容不同，拒绝覆盖已有数据", number)}
 		}
 		// 同号且全部业务字段一致：返回原证书，不增加历史记录。
-		return existing, true, nil
+		// 返回独立副本：调用方对返回结果的整理不能成为改写正式证书的途径。
+		dup := *existing
+		return &dup, true, nil
 	}
 
 	// 同一器具同一天不接受两张不同编号的证书。
@@ -433,7 +440,10 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 		l.data.Certificates = original
 		return nil, false, err
 	}
-	return l.findCertificate(number), false, nil
+	// 返回已保存证书的独立副本：返回结果只表示本次保存的内容，调用方的
+	// 后续整理不会连带改写台账内的正式证书。
+	saved := *l.findCertificate(number)
+	return &saved, false, nil
 }
 
 // certificatesOf 返回某器具的证书，按校准日期从新到旧排序；日期相同时

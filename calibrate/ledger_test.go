@@ -241,13 +241,13 @@ func TestCertificateNumberIdempotencyAndConflict(t *testing.T) {
 	if err != nil {
 		t.Fatalf("add first: %v", err)
 	}
-	// 再次提交同号且全部业务字段一致：返回原证书，不增加历史。
+	// 再次提交同号且全部业务字段一致：返回原证书内容，不增加历史。
 	again, dup, err := l.AddCertificate(in)
 	if err != nil || !dup {
 		t.Fatalf("幂等提交应成功并标记 duplicate，err=%v dup=%v", err, dup)
 	}
-	if again != first {
-		t.Fatal("幂等提交应返回原证书")
+	if *again != *first {
+		t.Fatalf("幂等提交应返回原证书内容：首次 %+v，再次 %+v", *first, *again)
 	}
 	if n := len(l.certificatesOf("M-1")); n != 1 {
 		t.Fatalf("历史证书不应增加，得到 %d 张", n)
