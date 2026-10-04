@@ -202,6 +202,14 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 
 // CancelPlan 取消一项未结束的计划，原因必须非空。取消后保留原计划、取消时间
 // 和原因，不再列入待办，也不能重新开启。找不到计划或计划已结束时拒绝。
+//
+// 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
+// 台账（含同一对象随后的计划查询、按器具核对与待办）与取消前完全一致——
+// 计划仍为未完成并继续列入待办，取消时间与原因保持空白，当前计划日期、
+// 最初计划日期、说明与已有改期记录都不改变，失败申请的原因和时间既不会
+// 被随后的提交当成“已结束”拒绝，也不会在其他成功操作写盘时被顺带写入；
+// 文件仍不可写时再次提交仍报保存错误。恢复可写后无需重新打开台账，
+// 重新提交才真正取消，取消时间取本次成功操作而非失败时刻。
 func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 	number, err := cleanText(number)
 	if err != nil {
@@ -211,17 +219,31 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("取消原因无效：%w", err)
 	}
-	p, err := l.requireOpenPlan(number)
-	if err != nil {
+	if _, err := l.requireOpenPlan(number); err != nil {
 		return nil, err
 	}
-	p.Status = PlanStatusCanceled
-	p.CanceledAt = l.now().Format(time.RFC3339)
-	p.CancelReason = reason
+	canceledAt := l.now().Format(time.RFC3339)
+	// 在整份计划切片的独立副本上暂存取消：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片（计划仍为未完成、取消时间与原因为空），保证同一
+	// 台账对象随后看到的计划状态、待办与核对都与取消前一致，再次提交不会被
+	// 当成已结束计划拒绝，失败信息也不会被之后的写盘顺带写入。
+	original := l.data.Plans
+	staged := make([]Plan, len(original))
+	copy(staged, original)
+	for i := range staged {
+		if staged[i].Number != number {
+			continue
+		}
+		staged[i].Status = PlanStatusCanceled
+		staged[i].CanceledAt = canceledAt
+		staged[i].CancelReason = reason
+	}
+	l.data.Plans = staged
 	if err := l.save(); err != nil {
+		l.data.Plans = original
 		return nil, err
 	}
-	return p, nil
+	return l.findPlan(number), nil
 }
 
 // CompletePlan 用一张台账中已有的证书完成计划。证书必须属于该器具，校准日期
