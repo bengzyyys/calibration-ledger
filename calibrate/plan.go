@@ -228,8 +228,17 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 // 不得早于计划最初建立的本机日期，且未被用于完成其他计划。符合条件后保存
 // 完成时间和证书编号；超差证书同样表示校准工作已完成。
 //
-// 再次用同一证书完成同一计划返回原结果，不增加记录或刷新完成时间；
-// 已完成计划改用另一证书、证书不存在或不符合条件、完成已取消计划均拒绝。
+// 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
+// 台账（含同一对象随后的计划查询、按器具核对与待办）与完成前完全一致——
+// 计划仍为未完成并继续列入待办，完成时间与关联证书编号保持操作前的值，
+// 计划日期、已有改期记录和待办日期标记都不改变，该证书也不会被算作已用于
+// 完成计划（既不会被随后的提交当成“此前已完成”跳过保存，也不会被其他成功
+// 写盘顺带写入文件）；恢复可写后无需重新打开台账，重新提交才真正完成，
+// 完成时间取本次成功操作而非失败时刻。
+//
+// 再次用同一证书完成同一已保存为完成的计划返回原结果，不增加记录或刷新
+// 完成时间；已完成计划改用另一证书、证书不存在或不符合条件、完成已取消
+// 计划均拒绝。
 func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, error) {
 	number, err := cleanText(number)
 	if err != nil {
@@ -288,13 +297,28 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 		}
 	}
 
-	p.Status = PlanStatusDone
-	p.CompletedAt = l.now().Format(time.RFC3339)
-	p.CertificateNumber = certificateNumber
+	completedAt := l.now().Format(time.RFC3339)
+	// 在整份计划切片的独立副本上暂存完成：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片（计划仍为未完成、完成时间与关联证书编号为空），
+	// 保证同一台账对象随后看到的计划状态、待办与证书占用都与完成前一致，
+	// 再次提交不会被当成“此前已完成”，失败信息也不会被之后的写盘顺带写入。
+	original := l.data.Plans
+	staged := make([]Plan, len(original))
+	copy(staged, original)
+	for i := range staged {
+		if staged[i].Number != number {
+			continue
+		}
+		staged[i].Status = PlanStatusDone
+		staged[i].CompletedAt = completedAt
+		staged[i].CertificateNumber = certificateNumber
+	}
+	l.data.Plans = staged
 	if err := l.save(); err != nil {
+		l.data.Plans = original
 		return nil, false, err
 	}
-	return p, false, nil
+	return l.findPlan(number), false, nil
 }
 
 // TodoItem 是待办查询中的一项计划及其按本机日期重新判断的标记。
