@@ -673,9 +673,10 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// parseUsageInstant 把申请时间（RFC3339，可带不同偏移或 Z）解析为实际时刻。
-// 不同文字形式（如 Z 与 +00:00）只要表示同一绝对时刻，解析结果即相同。
-func parseUsageInstant(s string) (time.Time, bool) {
+// parseInstant 把带偏移的 RFC3339 时间（如申请时间、计划建立时间，可带
+// 不同偏移或 Z）解析为实际时刻。不同文字形式（如 Z 与 +00:00）只要表示
+// 同一绝对时刻，解析结果即相同。
+func parseInstant(s string) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return time.Time{}, false
@@ -702,8 +703,8 @@ func (l *Ledger) UsageRecords() []UsageRecord {
 		out[i].Reasons = cloneReasons(out[i].Reasons)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseUsageInstant(out[i].RequestedAt)
-		tj, okj := parseUsageInstant(out[j].RequestedAt)
+		ti, oki := parseInstant(out[i].RequestedAt)
+		tj, okj := parseInstant(out[j].RequestedAt)
 		switch {
 		case oki && okj:
 			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录保存时

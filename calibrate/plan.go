@@ -488,9 +488,18 @@ type PlanView struct {
 	Marker string `json:"marker"`
 }
 
-// plansOf 返回某器具的全部计划（含已结束），按建立先后排列。
+// plansOf 返回某器具的全部计划（含已结束），按建立的实际时刻从早到晚排列。
 // 返回的是深拷贝（含改期历史）：调用方整理按器具查询或核对结果中的
 // 计划与改期记录，不会回写台账，也不会影响此前或之后分别取得的其他结果。
+//
+// CreatedAt 是带偏移的 RFC3339 时间：同一件器具的计划可能在不同系统时区
+// 偏移下（含 Z 与显式零偏移）先后建立。排序换算为同一基准下的绝对时刻，
+// 因此不能按时间文字里的日期、小时大小判断先后——文字日期更小或小时更小
+// 的记录未必更早，跨日记录也按实际时刻排列；各记录保存时自带的偏移决定
+// 先后，查询当天的系统时区不能改变这些历史的先后关系。已完成、已取消与
+// 未完成的计划一起参与排序，状态、当前计划日期、改期时间与完成时间均不作
+// 排序条件。实际时刻相同的记录（即使分别使用 Z、+00:00 或其他偏移）由
+// SliceStable 保留其在台账中的原有次序，每项都单独保留、不合并。
 func (l *Ledger) plansOf(id string) []Plan {
 	var out []Plan
 	for _, p := range l.data.Plans {
@@ -498,7 +507,24 @@ func (l *Ledger) plansOf(id string) []Plan {
 			out = append(out, clonePlan(p))
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, oki := parseInstant(out[i].CreatedAt)
+		tj, okj := parseInstant(out[j].CreatedAt)
+		switch {
+		case oki && okj:
+			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录建立时
+			// 所带的偏移及文字形式无关；时刻相同时返回 false，交由
+			// SliceStable 保留它们在台账中的原有次序。
+			return ti.Before(tj)
+		case oki != okj:
+			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
+			// 正常由本台账保存的 RFC3339 记录不会走到这里。
+			return oki
+		default:
+			// 两条都无法解析时退回按原文字比较，保证结果确定。
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+	})
 	return out
 }
 
@@ -517,10 +543,21 @@ func (l *Ledger) planViews(id string, today time.Time) []PlanView {
 	return out
 }
 
-// Plans 返回某器具的全部计划（含已结束），按建立先后排列；
-// 器具不存在时报 ErrNotFound。返回的计划（含改期历史）都是独立展示副本：
-// 调用方调换顺序、删改或追加记录或改动任何字段，只影响自己手中的结果，
-// 不回写台账，也不影响此前或之后分别取得的操作结果与核对结果。查询不写盘。
+// Plans 返回某器具的全部计划（含已完成、已取消与未完成），按建立的实际
+// 时刻从早到晚排列；器具不存在时报 ErrNotFound。
+//
+// CreatedAt 是带偏移的 RFC3339 时间：同一件器具的计划可能在不同系统时区
+// 偏移下（含 Z 与显式零偏移）先后建立，排序换算为同一基准下的绝对时刻，
+// 因此显示文字里日期、小时更大的计划未必更晚，跨日计划也按实际时刻排列；
+// 各计划保存时自带的偏移决定先后，查询当天的系统时区不能改变历史顺序。
+// 已完成、已取消与未完成的计划一起参与排序，计划状态、当前计划日期、改期
+// 时间与完成时间均不作为排序条件。实际时刻相同的计划（即使分别使用 Z、
+// +00:00 或其他偏移）保留其在台账中的原有次序，每项都单独返回、不合并。
+//
+// 返回的计划（含改期历史）都是独立展示副本：建立时间保留原文字及偏移，
+// 计划日期、改期历史、取消信息及关联证书编号都保持保存时的内容；调用方
+// 调换顺序、删改或追加记录或改动任何字段，只影响自己手中的结果，不回写
+// 台账，也不影响此前或之后分别取得的操作结果与核对结果。查询不写盘。
 func (l *Ledger) Plans(instrumentID string) ([]PlanView, error) {
 	id := strings.TrimSpace(instrumentID)
 	inst := l.findInstrument(id)
