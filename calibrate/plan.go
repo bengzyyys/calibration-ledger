@@ -119,6 +119,14 @@ func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
 // 显示而改动编号、日期、状态或关联证书，不占用或释放正式计划编号，不影响
 // 每件器具最多一项未结束计划的判断，也不会在此后正常写盘时被带入台账文件；
 // 重新查询同一台账得到的仍是最后成功保存的计划。
+//
+// 业务校验全部通过后才写盘：只有真正保存成功，这项计划才算建立。若台账文件
+// 无法写入或替换，明确返回保存错误，台账（含同一对象随后的计划查询、待办与
+// 按器具核对）与建立前完全一致——失败的计划不占用编号，也不占用该器具唯一的
+// 未结束计划名额，不会在此后其他成功操作写盘时被顺带写入；文件仍不可写时再次
+// 提交相同编号与内容仍报保存错误（不会被当成编号重复或器具已有未结束计划而
+// 业务拒绝）；恢复可写后无需重新打开台账，重新提交才作为新计划建立，
+// 建立时间取本次成功申请的时间。
 func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 	number, err := cleanText(in.Number)
 	if err != nil {
@@ -159,8 +167,17 @@ func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 		CreatedAt:    l.now().Format(time.RFC3339),
 		Status:       PlanStatusOpen,
 	}
-	l.data.Plans = append(l.data.Plans, p)
+	// 在独立的新切片上暂存新计划：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片，保证同一台账对象随后看到的计划、编号占用与
+	// 每件器具最多一项未结束计划的判断都与建立前一致，且失败计划不会被
+	// 之后的写盘顺带写入。
+	original := l.data.Plans
+	staged := make([]Plan, 0, len(original)+1)
+	staged = append(staged, original...)
+	staged = append(staged, p)
+	l.data.Plans = staged
 	if err := l.save(); err != nil {
+		l.data.Plans = original
 		return nil, err
 	}
 	return clonePlanPtr(l.findPlan(number)), nil
