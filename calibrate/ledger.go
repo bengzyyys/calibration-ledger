@@ -232,6 +232,19 @@ func (l *Ledger) findInstrument(id string) *Instrument {
 	return nil
 }
 
+// Instrument 按编号返回登记器具的独立副本；编号不存在时返回包装了
+// ErrNotFound 的错误。它只读取该器具自身的登记信息，不组装历史证书、
+// 使用拒绝记录或校准计划：显示一张证书的结论只需要证书自身的测得误差
+// 与该器具登记的允许误差，不需要完整核对结果。
+func (l *Ledger) Instrument(id string) (*Instrument, error) {
+	inst := l.findInstrument(id)
+	if inst == nil {
+		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
+	}
+	saved := *inst
+	return &saved, nil
+}
+
 func (l *Ledger) findCertificate(number string) *Certificate {
 	for i := range l.data.Certificates {
 		if l.data.Certificates[i].Number == number {
