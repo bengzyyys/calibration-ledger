@@ -250,6 +250,13 @@ type RegisterInput struct {
 
 // Register 登记一件新器具。编号、名称不得为空白，允许误差必须是不小于零的
 // 有限数；编号重复或输入无效时明确拒绝，原记录不变。新器具处于待校准状态。
+//
+// 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
+// 台账（含同一对象随后的列出、按器具核对与使用判断）与登记前完全一致——
+// 失败的器具不进入列表、不占用编号，也不会在此后其他成功操作写盘时被顺带
+// 写入；文件仍不可写时再次提交同号仍报保存错误（不会被当成编号重复），
+// 恢复可写后无需重新打开台账，重新提交才作为新器具登记，登记时间取本次
+// 成功提交的时间。
 func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 	id, err := cleanText(in.ID)
 	if err != nil {
@@ -275,11 +282,21 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 		Status:       StatusPending,
 		RegisteredAt: l.now().Format(time.RFC3339),
 	}
-	l.data.Instruments = append(l.data.Instruments, inst)
+	// 在独立的新切片上暂存新器具：只有原子替换台账文件成功后才提交。
+	// 写盘失败时恢复原切片，保证同一台账对象随后看到的器具列表、编号占用
+	// 与登记前一致，失败器具也不会被之后的写盘顺带写入。
+	original := l.data.Instruments
+	staged := make([]Instrument, 0, len(original)+1)
+	staged = append(staged, original...)
+	staged = append(staged, inst)
+	l.data.Instruments = staged
 	if err := l.save(); err != nil {
+		l.data.Instruments = original
 		return nil, err
 	}
-	return &inst, nil
+	// 返回已保存器具的独立副本：返回结果只表示本次保存的内容。
+	saved := *l.findInstrument(id)
+	return &saved, nil
 }
 
 // SetStatus 切换器具状态。切换为在用不代表已校准；停用不删除证书与使用记录。
