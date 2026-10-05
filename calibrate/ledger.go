@@ -673,19 +673,75 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// UsageRecords 返回全部使用申请记录，按申请时间排序。
-// 返回的是展示副本：整理其中原因不会改动台账内已冻结的留痕，
-// 也不会被后续正常写盘带入文件。
-func (l *Ledger) UsageRecords() []UsageRecord {
-	out := append([]UsageRecord(nil), l.data.Usage...)
-	for i := range out {
-		out[i].Reasons = cloneReasons(out[i].Reasons)
+// parseUsageInstant 按申请记录保存时的原文（RFC3339，含各自的时区偏移）
+// 解析申请发生的实际时刻。台账记录统一按该布局写入；对无法解析的旧记录
+// 返回 ok=false，由排序方按原文字兜底，保证结果仍然完全确定。
+func parseUsageInstant(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].RequestedAt != out[j].RequestedAt {
-			return out[i].RequestedAt < out[j].RequestedAt
+	return t, true
+}
+
+// UsageRecords 返回全部使用申请记录，按申请发生的实际时刻从早到晚排序。
+//
+// RequestedAt 保留保存时的原文字及偏移；同一本机台账中的记录可以带不同
+// 时区偏移，不能直接按文字先后排列（例如 10:30:00+09:00 实际比
+// 10:00:00+08:00 早半小时，跨日记录同理），必须先解析为统一时刻再比较：
+//   - 实际时刻不同：从早到晚；获准与被拒绝的申请一起参与排序，申请结果
+//     不是排序条件；
+//   - 实际时刻相同：Z 与 +00:00 等文字形式只要表示同一时刻就不作区分，
+//     再按器具编号升序；
+//   - 同一器具在同一时刻的多次申请：保留它们在台账中的原有次序，逐条保留，
+//     不合并。
+//
+// 先后只由各条记录保存时的时间决定：系统时区变化或查询当天处在不同时区，
+// 都不改变历史顺序。查询不新增使用申请、不写回台账。返回的是展示副本：
+// 整理其中原因不会改动台账内已冻结的留痕，也不会被后续正常写盘带入文件，
+// 分别取得的两份结果互不影响。没有记录时返回空结果，只有一条时原样返回。
+func (l *Ledger) UsageRecords() []UsageRecord {
+	// 把每条记录与按其原文（含各自偏移）解析出的实际时刻绑定在一起，
+	// 排序交换时时刻随记录一起移动，避免按位置错位。
+	type orderedUsage struct {
+		rec UsageRecord
+		at  time.Time
+		ok  bool
+	}
+	rows := make([]orderedUsage, len(l.data.Usage))
+	for i, u := range l.data.Usage {
+		u.Reasons = cloneReasons(u.Reasons)
+		at, ok := parseUsageInstant(u.RequestedAt)
+		rows[i] = orderedUsage{rec: u, at: at, ok: ok}
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		// 稳定排序：实际时刻、器具编号都相同时（同一器具同一时刻的多次
+		// 申请，或 Z 与零偏移等同义写法），比较器返回 false 以保留它们
+		// 在台账中的原有次序，不依赖时间的文字形式再分先后。
+		switch {
+		case rows[i].ok && rows[j].ok:
+			if !rows[i].at.Equal(rows[j].at) {
+				return rows[i].at.Before(rows[j].at)
+			}
+		case !rows[i].ok && !rows[j].ok:
+			// 正常台账不会出现无法解析的时间；两条都无法解析时按原文字
+			// 兜底，保持可确定的先后。
+			if rows[i].rec.RequestedAt != rows[j].rec.RequestedAt {
+				return rows[i].rec.RequestedAt < rows[j].rec.RequestedAt
+			}
+		default:
+			// 仅一条无法解析时，让时刻可解析的已知记录排在前面，
+			// 保证混合情况下的排序仍然完全确定。
+			return rows[i].ok
 		}
-		return out[i].InstrumentID < out[j].InstrumentID
+		if rows[i].rec.InstrumentID != rows[j].rec.InstrumentID {
+			return rows[i].rec.InstrumentID < rows[j].rec.InstrumentID
+		}
+		return false
 	})
+	out := make([]UsageRecord, len(rows))
+	for i := range rows {
+		out[i] = rows[i].rec
+	}
 	return out
 }
