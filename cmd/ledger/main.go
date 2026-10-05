@@ -342,22 +342,26 @@ func cmdCert(l *calibrate.Ledger, args []string, opts options, stdout, stderr io
 	if duplicate {
 		note = "同号证书且内容一致，返回原证书，未增加历史记录"
 	}
-	verdict := "合格"
-	if math.Abs(cert.Error) > allowedErrorOf(l, cert.InstrumentID) {
-		verdict = "超差"
-	}
+	// 本次证书的结论与核对中最近证书、历史证书共用同一条规则
+	// （Certificate.Pass）：测得误差绝对值不超过所属器具的允许误差即合格。
+	verdict := verdictText(cert.Pass(allowedErrorOf(l, cert.InstrumentID)))
 	human := fmt.Sprintf("%s：%s（器具 %s，校准日期 %s，截止日 %s，测得误差 %g，判定：%s）\n",
 		note, cert.Number, cert.InstrumentID, cert.CalDate, cert.Expiry, cert.Error, verdict)
 	return emit(opts, stdout, stderr, human,
 		map[string]any{"accepted": true, "duplicate": duplicate, "verdict": verdict, "certificate": cert})
 }
 
+// allowedErrorOf 返回器具登记的允许误差。证书结论只依赖这张证书的测得误差
+// 与所属器具的允许误差，因此这里只查登记信息，不取核对中的历史证书、
+// 使用拒绝记录或校准计划。
 func allowedErrorOf(l *calibrate.Ledger, id string) float64 {
-	r, err := l.Review(id)
-	if err != nil {
-		return 0
+	for _, inst := range l.Instruments() {
+		if inst.ID == id {
+			return inst.AllowedError
+		}
 	}
-	return r.Instrument.AllowedError
+	// 证书能录入成功，所属器具必然已登记，不会走到这里。
+	return 0
 }
 
 func cmdUse(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
