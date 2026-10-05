@@ -97,13 +97,16 @@ func clonePlanPtr(p *Plan) *Plan {
 	return &cp
 }
 
-// validatePlanDate 解析 YYYY-MM-DD 真实日期，且不得早于本机今天。
-func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
+// validatePlanDateAt 解析 YYYY-MM-DD 真实日期，且不得早于 at 所在的本机
+// 日历日期。日期合法性必须与正式记录采用同一次申请开始时的时刻：申请开始
+// 后即使跨过午夜（如 23:59:59 开始、保存完成时已是次日），当天日期仍合法，
+// 不会在判断与留痕之间分裂成两天。
+func validatePlanDateAt(raw, field string, at time.Time) (string, error) {
 	_, text, err := parseFiniteDate(raw, field)
 	if err != nil {
 		return "", err
 	}
-	todayText := l.now().Format(DateLayout)
+	todayText := at.Format(DateLayout)
 	if text < todayText {
 		return "", validationError("%s %s 不能早于本机今天 %s", field, text, todayText)
 	}
@@ -114,6 +117,13 @@ func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
 // 已结束计划也不能复用），计划日期须真实存在且不早于本机今天，说明非空；
 // 每件器具最多有一项未完成、未取消的计划。任一条件不满足都明确拒绝，
 // 不新增或改动任何记录。
+//
+// 计划日期的“本机今天”与正式记录的建立时间对应同一次申请：处理本次申请
+// 开始时只取一次本机时刻，用它所在的本机日历日期判断计划日期，并把该时刻
+// 作为建立时间保存。申请在 23:59:59 开始、保存完成时已进入次日时，填写当天
+// 日期仍合法，当前计划日期、最初计划日期与建立时间都属于申请开始的那一天，
+// 不会改填次日或采用保存结束时间；该时刻不延续到下一次申请——再次提交时按
+// 新一次申请开始时的本机日期判断，已过去的日期明确拒绝。
 //
 // 业务校验全部通过后才写盘：若台账文件无法写入或替换，明确返回保存错误，
 // 台账（含同一对象随后的计划查询、按器具核对与待办）与建立前完全一致——
@@ -127,6 +137,10 @@ func (l *Ledger) validatePlanDate(raw, field string) (string, error) {
 // 每件器具最多一项未结束计划的判断，也不会在此后正常写盘时被带入台账文件；
 // 重新查询同一台账得到的仍是最后成功保存的计划。
 func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
+	// 本次建立申请只在开始处理时取一次本机时刻：计划日期合法性与正式记录的
+	// 建立时间都对应它，即使随后的校验与保存跨过午夜也不会分裂成两天；该时刻
+	// 不延续到下一次申请，下次调用重新取当时的本机日期。
+	requestedAt := l.now()
 	number, err := cleanText(in.Number)
 	if err != nil {
 		return nil, fmt.Errorf("计划编号无效：%w", err)
@@ -142,7 +156,7 @@ func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 	if l.findInstrument(instID) == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", instID, ErrNotFound)
 	}
-	dateText, err := l.validatePlanDate(in.Date, "计划日期")
+	dateText, err := validatePlanDateAt(in.Date, "计划日期", requestedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -163,7 +177,7 @@ func (l *Ledger) CreatePlan(in PlanInput) (*Plan, error) {
 		PlannedDate:  dateText,
 		OriginalDate: dateText,
 		Note:         note,
-		CreatedAt:    l.now().Format(time.RFC3339),
+		CreatedAt:    requestedAt.Format(time.RFC3339),
 		Status:       PlanStatusOpen,
 	}
 	// 在独立的新切片上暂存新计划：只有原子替换台账文件成功后才提交。
@@ -219,7 +233,7 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("改期原因无效：%w", err)
 	}
-	dateText, err := l.validatePlanDate(newDate, "新计划日期")
+	dateText, err := validatePlanDateAt(newDate, "新计划日期", l.now())
 	if err != nil {
 		return nil, err
 	}
