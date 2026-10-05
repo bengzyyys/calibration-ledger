@@ -631,6 +631,8 @@ type InstrumentReview struct {
 // 整份核对只采用核对开始时的一次本机日期：即使查询结束前跨过午夜，
 // 能否使用、最近证书、历史证书到期判断与未结束计划标记也不会各自变成新一天。
 // 历史拒绝原因按申请当时的冻结内容展示，不随本次采用的日期重新计算。
+// 校准计划（含已完成、已取消与未完成）与 Plans 入口一致：一起按建立的
+// 实际时刻从早到晚排列，查询当天的系统时区不改变跨时区记录的先后。
 // 返回的证书、拒绝记录与计划（含改期历史）都是独立展示副本，调用方的
 // 整理不回写台账，也不影响此前或之后分别取得的其他结果。
 func (l *Ledger) Review(id string) (*InstrumentReview, error) {
@@ -673,9 +675,9 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// parseUsageInstant 把申请时间（RFC3339，可带不同偏移或 Z）解析为实际时刻。
-// 不同文字形式（如 Z 与 +00:00）只要表示同一绝对时刻，解析结果即相同。
-func parseUsageInstant(s string) (time.Time, bool) {
+// parseRFC3339Instant 把带偏移的 RFC3339 时间（可含不同偏移或 Z）解析为实际
+// 时刻。不同文字形式（如 Z 与 +00:00）只要表示同一绝对时刻，解析结果即相同。
+func parseRFC3339Instant(s string) (time.Time, bool) {
 	t, err := time.Parse(time.RFC3339, s)
 	if err != nil {
 		return time.Time{}, false
@@ -702,8 +704,8 @@ func (l *Ledger) UsageRecords() []UsageRecord {
 		out[i].Reasons = cloneReasons(out[i].Reasons)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseUsageInstant(out[i].RequestedAt)
-		tj, okj := parseUsageInstant(out[j].RequestedAt)
+		ti, oki := parseRFC3339Instant(out[i].RequestedAt)
+		tj, okj := parseRFC3339Instant(out[j].RequestedAt)
 		switch {
 		case oki && okj:
 			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录保存时

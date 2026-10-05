@@ -488,7 +488,14 @@ type PlanView struct {
 	Marker string `json:"marker"`
 }
 
-// plansOf 返回某器具的全部计划（含已结束），按建立先后排列。
+// plansOf 返回某器具的全部计划（含已结束），按建立的实际时刻从早到晚排列。
+// CreatedAt 是带偏移的 RFC3339 时间：同一份台账可能在不同系统时区偏移下
+// （含 Z 与显式零偏移）留下记录，排序时换算为同一基准下的绝对时刻，因此
+// 文字里日期、小时更大的记录未必更晚，跨日记录也按实际时刻排列；记录各自
+// 保存时的偏移决定先后，查询当天的系统时区不能改变历史顺序。已完成、已取消
+// 与未完成的计划一起按建立时刻排列，计划状态、当前计划日期、改期时间或完成
+// 时间都不参与排序。实际时刻相同的多项计划（即使分别使用 Z、+00:00 或其他
+// 偏移）由稳定排序保留其在台账中的原有次序，每项都保留、不合并。
 // 返回的是深拷贝（含改期历史）：调用方整理按器具查询或核对结果中的
 // 计划与改期记录，不会回写台账，也不会影响此前或之后分别取得的其他结果。
 func (l *Ledger) plansOf(id string) []Plan {
@@ -498,7 +505,24 @@ func (l *Ledger) plansOf(id string) []Plan {
 			out = append(out, clonePlan(p))
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt < out[j].CreatedAt })
+	sort.SliceStable(out, func(i, j int) bool {
+		ti, oki := parseRFC3339Instant(out[i].CreatedAt)
+		tj, okj := parseRFC3339Instant(out[j].CreatedAt)
+		switch {
+		case oki && okj:
+			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录保存时
+			// 所带的偏移及文字形式无关；同刻返回 false，由 SliceStable
+			// 保留台账中的原有次序，不按状态或计划编号再分先后。
+			return ti.Before(tj)
+		case oki != okj:
+			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
+			// 正常由本台账保存的 RFC3339 记录不会走到这里。
+			return oki
+		default:
+			// 两条都无法解析时退回按原文字比较，保证结果确定。
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+	})
 	return out
 }
 
@@ -517,7 +541,10 @@ func (l *Ledger) planViews(id string, today time.Time) []PlanView {
 	return out
 }
 
-// Plans 返回某器具的全部计划（含已结束），按建立先后排列；
+// Plans 返回某器具的全部计划（含已结束），已完成、已取消与未完成的计划
+// 一起按建立的实际时刻从早到晚排列（不同时区偏移的记录按其保存时的偏移
+// 换算为同一基准比较，查询当天的系统时区不改变历史先后；实际时刻相同的
+// 多项计划保留台账原有次序，每项单独返回、不合并）；
 // 器具不存在时报 ErrNotFound。返回的计划（含改期历史）都是独立展示副本：
 // 调用方调换顺序、删改或追加记录或改动任何字段，只影响自己手中的结果，
 // 不回写台账，也不影响此前或之后分别取得的操作结果与核对结果。查询不写盘。
