@@ -370,8 +370,15 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 			"证书 %s 属于器具 %s，不能用于完成器具 %s 的计划 %s",
 			certificateNumber, cert.InstrumentID, p.InstrumentID, number)
 	}
-	// 计划建立的本机日期：CreatedAt 是 RFC3339，取其日历日期；与证书校准日期
-	// 按日历日期比较，校准日期不得早于该日期（等于可以）。
+	// 计划建立的本机日期：CreatedAt 是带“建立当时时区偏移”的 RFC3339。
+	// time.Parse 返回的时刻自带该固定偏移，直接 Format 取到的就是建立时所在的
+	// 本机日历日期；绝不能先 In(time.Local) 或 .UTC() 换算再取日——完成操作
+	// 可能发生在另一个时区（或本机此后切换了时区），换算会把跨日的建立时刻移到
+	// 相邻的日历日：东八区凌晨（00:30+08:00）换算 UTC 落到前一天、西七区深夜
+	// （23:30-07:00）换算 UTC 落到后一天，都会使日期界限被错误地提前或推后。
+	// 界限锚定在记录保存的偏移所表示的那一天上，与本次运行的时区、日期无关。
+	// 与证书校准日期按日历日期比较，校准日期不得早于该日期（等于可以）；
+	// 证书只记载日期、没有时分秒，建立当天的证书不因建立钟点较晚而被判过早。
 	created, perr := time.Parse(time.RFC3339, p.CreatedAt)
 	if perr != nil {
 		return nil, false, fmt.Errorf("计划 %s 建立时间已损坏: %w", number, perr)
