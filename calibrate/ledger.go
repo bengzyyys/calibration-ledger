@@ -494,8 +494,19 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 	return &saved, false, nil
 }
 
-// certificatesOf 返回某器具的证书，按校准日期从新到旧排序；日期相同时
-// （实际业务不会允许同日多证）以证书编号排序保证结果稳定。
+// certNewer 是“最近证书”的唯一先后规则：校准日期较新者在前，与录入先后、
+// 到期先后或合格结论无关；校准日期相同时（正常业务下同器具同日只允许一张）
+// 按证书编号升序，保证并列时结果稳定。
+func certNewer(a, b Certificate) bool {
+	if a.CalDate != b.CalDate {
+		return a.CalDate > b.CalDate
+	}
+	return a.Number < b.Number
+}
+
+// certificatesOf 收集并整理某器具的完整证书历史，按校准日期从新到旧排序。
+// 只在确实需要完整历史的按器具核对中使用；只要最近证书的入口不应走这里，
+// 避免为取一张证书而收集、排序整段历史。切片元素都是台账证书的独立副本。
 func (l *Ledger) certificatesOf(id string) []Certificate {
 	var out []Certificate
 	for _, c := range l.data.Certificates {
@@ -503,23 +514,48 @@ func (l *Ledger) certificatesOf(id string) []Certificate {
 			out = append(out, c)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].CalDate != out[j].CalDate {
-			return out[i].CalDate > out[j].CalDate
-		}
-		return out[i].Number < out[j].Number
-	})
+	sort.Slice(out, func(i, j int) bool { return certNewer(out[i], out[j]) })
 	return out
 }
 
-// LatestCertificate 返回器具按校准日期确定的最近证书；没有证书时返回 nil。
-// 最近证书与录入先后无关，补录较早证书只增加历史。
-func (l *Ledger) LatestCertificate(id string) *Certificate {
-	cs := l.certificatesOf(id)
-	if len(cs) == 0 {
+// latestOf 从已按 certNewer 排好序的证书中取出最近证书的独立副本；
+// 空切片返回 nil。
+func latestOf(certs []Certificate) *Certificate {
+	if len(certs) == 0 {
 		return nil
 	}
-	return &cs[0]
+	latest := certs[0]
+	return &latest
+}
+
+// latestCertificate 只扫描一遍该器具自身的证书挑出最近一张，不收集、不排序
+// 完整历史：只查询最近证书或判断能否使用时，不必承担整理整段历史的工作。
+// 归属过滤保证其他器具的证书既不会混入也不会影响本器具的最近证书选择。
+// 返回的是独立副本，调用方的整理不会回写台账。
+func (l *Ledger) latestCertificate(id string) *Certificate {
+	best := Certificate{}
+	found := false
+	for _, c := range l.data.Certificates {
+		if c.InstrumentID != id {
+			continue
+		}
+		if !found || certNewer(c, best) {
+			best = c
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	latest := best
+	return &latest
+}
+
+// LatestCertificate 返回器具按校准日期确定的最近证书；没有证书时返回 nil。
+// 最近证书与录入先后、到期先后或合格结论无关，补录较早证书只增加历史、
+// 不改变最近证书。它只挑出这一张证书，不组装完整历史；返回的是独立副本。
+func (l *Ledger) LatestCertificate(id string) *Certificate {
+	return l.latestCertificate(id)
 }
 
 // CertificateView 是证书及其在当前日期下的判定结果。
@@ -547,20 +583,15 @@ type UsageDecision struct {
 	evaluatedAt  time.Time
 }
 
-// evaluateAt 按器具状态与“最近证书”判定 now 所在本机日历日期能否使用，
-// 并列出全部适用原因。最近证书超差或到期时不会回退到更早的合格证书。
-// 同一次核对的各部分必须共用同一个 now，避免跨午夜时判断不一致。
-func (l *Ledger) evaluateAt(id string, now time.Time) (*Instrument, *UsageDecision) {
-	today := now
-	inst := l.findInstrument(id)
-	if inst == nil {
-		return nil, nil
-	}
-	d := &UsageDecision{InstrumentID: id, evaluatedAt: today}
+// decideUsage 按器具状态与“最近证书”判定 today 所在本机日历日期能否使用，
+// 并列出全部适用原因。最近证书由调用方按 certNewer 确定后传入（只取最近一张
+// 或来自完整历史均可）：最近证书超差或到期时不会回退到更早的合格证书。
+// 同一次核对的各部分必须共用同一个 today，避免跨午夜时判断不一致。
+func decideUsage(inst *Instrument, latest *Certificate, today time.Time) *UsageDecision {
+	d := &UsageDecision{InstrumentID: inst.ID, evaluatedAt: today}
 	if inst.Status != StatusInUse {
 		d.Reasons = append(d.Reasons, fmt.Sprintf("器具当前状态为%s，只有在用器具可以申请使用", inst.Status))
 	}
-	latest := l.LatestCertificate(id)
 	if latest == nil {
 		d.Reasons = append(d.Reasons, "没有校准证书")
 	} else {
@@ -577,7 +608,17 @@ func (l *Ledger) evaluateAt(id string, now time.Time) (*Instrument, *UsageDecisi
 		}
 	}
 	d.Allowed = len(d.Reasons) == 0
-	return inst, d
+	return d
+}
+
+// evaluateAt 按器具状态与“最近证书”判定 now 所在本机日历日期能否使用。
+// 只查询能否使用时只扫描挑出最近证书（latestCertificate），不整理完整历史。
+func (l *Ledger) evaluateAt(id string, now time.Time) (*Instrument, *UsageDecision) {
+	inst := l.findInstrument(id)
+	if inst == nil {
+		return nil, nil
+	}
+	return inst, decideUsage(inst, l.latestCertificate(id), now)
 }
 
 // CanUse 只按当前数据评估能否使用，不留存申请记录。
@@ -665,10 +706,17 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	// 本次核对只在开始时取一次本机时间，整份结果共用，跨午夜不分裂判断；
 	// 下一次核对会重新取当时的本机日期，不沿用本次结果。
 	now := l.now()
-	inst, d := l.evaluateAt(id, now)
+	inst := l.findInstrument(id)
 	if inst == nil {
 		return nil, fmt.Errorf("器具编号 %s：%w", id, ErrNotFound)
 	}
+	// 核对需要完整历史：该器具的证书只收集、排序这一次。历史视图与最近证书
+	// 都从同一份结果派生（最近证书即排序后的第一张），并共用同一个 today，
+	// 不再为最近证书单独整理一遍历史——也保证同一张证书在最近证书与历史中
+	// 编号、日期、误差、方法、摘要与到期判定完全一致，不会一边未到期一边到期。
+	certs := l.certificatesOf(id)
+	today := now
+	d := decideUsage(inst, latestOf(certs), today)
 	r := &InstrumentReview{
 		Instrument: *inst,
 		CanUse:     d.Allowed,
@@ -678,8 +726,9 @@ func (l *Ledger) Review(id string) (*InstrumentReview, error) {
 	if r.Reasons == nil {
 		r.Reasons = []string{}
 	}
-	today := now
-	for _, c := range l.certificatesOf(id) {
+	// 历史沿用既有空结果表现：没有证书时保持 nil（普通输出显示“无”，
+	// JSON 为 null）；有证书时按校准日期由近到远追加。
+	for _, c := range certs {
 		r.History = append(r.History, viewCertificate(c, inst.AllowedError, today))
 	}
 	for _, u := range l.data.Usage {
