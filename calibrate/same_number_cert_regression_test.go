@@ -27,6 +27,10 @@ import (
 // 内容、历史数量与最近证书选择都与提交前一致；把同号证书挂到另一件器具
 // 时，目标器具不能多出这张证书；原证书超差时把误差改成合格值重交、原
 // 证书已到期时把截止日改成未来重交，都不能解除或恢复使用资格。
+//
+// 最后守住同号判定与本机日期无关：证书合法保存后本机日期回拨（当前日历
+// 日期落到证书校准日期之前），同号同内容仍返回原证书、同号不同内容仍报
+// 冲突；未来日期限制只约束台账中不存在的新编号证书。
 
 // sameNumberBaseInput 是同号判定回归的标准证书内容：校准日期早于假时钟的
 // 本机今天，截止日晚于校准日期，误差有限，方法与摘要非空。
@@ -110,6 +114,84 @@ func TestSameNumberSameContentReturnsOriginalAndKeepsFirstSaveTime(t *testing.T)
 	}
 	if strings.HasPrefix(stored.CreatedAt, "2026-10-02") {
 		t.Fatalf("更晚的重复提交不能刷新录入时间，得到 %s", stored.CreatedAt)
+	}
+}
+
+// TestSameNumberLocalDateMovedBackwardKeepsDuplicateAndConflict 覆盖本机日期
+// 回拨场景：证书在本机日期 2026-10-06 合法录入（校准日期同为 2026-10-06）后，
+// 本机日期回拨到 2026-10-05，当前日历日期落到该证书校准日期之前。本机日期
+// 变化不能把已有证书的重复提交变成一次失败的新录入：
+//   - 同号同内容原样重交：仍返回原证书并标明重复，不增加历史、不刷新录入时间，
+//     不切换器具状态、不新增使用申请；
+//   - 同号但校准方法、摘要或测得误差不同：仍明确报编号冲突，而不是报未来日期
+//     或返回重复成功，原证书不被覆盖；
+//   - 台账中不存在的新编号、校准日期仍晚于本机今天：必须继续被拒绝，不新增
+//     证书、不占用编号；本机日期正常推进后该编号可正常录入。
+func TestSameNumberLocalDateMovedBackwardKeepsDuplicateAndConflict(t *testing.T) {
+	clock, l := setupSameNumberLedger(t, mustDate(t, "2026-10-06").Add(9*time.Hour))
+	in := sameNumberBaseInput()
+	in.CalDate = "2026-10-06"
+	in.Expiry = "2027-10-06"
+	first, dup, err := l.AddCertificate(in)
+	if err != nil || dup || first == nil {
+		t.Fatalf("校准日期与本机今天同为 2026-10-06 应正常录入：err=%v dup=%v", err, dup)
+	}
+
+	// 本机日期回拨一天：当前日历日期落到证书校准日期之前。
+	clock.t = mustDate(t, "2026-10-05").Add(12 * time.Hour)
+
+	// 同号同内容：返回原证书并标明重复，不增加历史。
+	again, isDup, err := l.AddCertificate(in)
+	if err != nil || !isDup || again == nil {
+		t.Fatalf("日期回拨后同号同内容应成功返回原证书：err=%v dup=%v cert=%v",
+			err, isDup, again)
+	}
+	if *again != *first {
+		t.Fatalf("应返回首次保存的原证书：首次 %+v，再次 %+v", *first, *again)
+	}
+	assertStoredCertIntact(t, l, *first)
+	if n := len(l.data.Usage); n != 0 {
+		t.Fatalf("重复提交不能新增使用申请，得到 %d 条", n)
+	}
+	if got := l.findInstrument("M-1").Status; got != StatusPending {
+		t.Fatalf("重复提交不能切换器具状态，得到 %s", got)
+	}
+
+	// 同号不同内容（方法、摘要、测得误差分别变化，内容本身合法）：报编号冲突，
+	// 而不是报未来日期或返回重复成功；原证书不被覆盖。
+	for i, mut := range []func(*CertificateInput){
+		func(c *CertificateInput) { c.Method = "规范B" },
+		func(c *CertificateInput) { c.Summary = "另一份摘要" },
+		func(c *CertificateInput) { c.Error = 0.2 },
+	} {
+		changed := in
+		mut(&changed)
+		cert, d, err := l.AddCertificate(changed)
+		if !IsConflict(err) || cert != nil || d {
+			t.Fatalf("第 %d 个变化应报编号冲突：err=%v cert=%v dup=%v", i+1, err, cert, d)
+		}
+		if IsValidation(err) {
+			t.Fatalf("第 %d 个变化不能被降级成普通输入无效：%v", i+1, err)
+		}
+	}
+	assertStoredCertIntact(t, l, *first)
+
+	// 新编号、校准日期晚于本机今天：继续被拒绝，不新增证书、不占用编号。
+	future := in
+	future.InstrumentID = "M-2"
+	future.Number = "C-2"
+	if _, _, err := l.AddCertificate(future); !IsValidation(err) ||
+		!strings.Contains(err.Error(), "不能晚于本机今天") {
+		t.Fatalf("新编号未来日期应继续被拒绝：%v", err)
+	}
+	if l.findCertificate("C-2") != nil || len(l.data.Certificates) != 1 {
+		t.Fatalf("被拒绝的新编号不能留下证书或占用编号：%+v", l.data.Certificates)
+	}
+
+	// 本机日期正常推进到校准日期当天后，该编号可正常录入。
+	clock.t = mustDate(t, "2026-10-06").Add(8 * time.Hour)
+	if _, _, err := l.AddCertificate(future); err != nil {
+		t.Fatalf("日期正常推进后新编号应可正常录入：%v", err)
 	}
 }
 

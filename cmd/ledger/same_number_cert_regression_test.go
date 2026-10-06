@@ -22,6 +22,9 @@ import (
 //     accepted=false、conflict=true，且不返回录入成功的证书。冲突不能被
 //     降级成普通输入无效（那种拒绝 conflict=false），也不能悄悄替换原证书。
 //
+// 同号判定与本机日期无关：证书合法保存后本机日期回拨，同号同内容仍退出 0
+// 返回原证书，同号不同内容仍退出 1 报冲突；未来日期限制只约束新编号证书。
+//
 // 日期相对本机今天构造，不依赖任何固定日期恰好仍在未来或已过去。
 
 // sameNumberCertArgs 构造一条可指定全部字段的证书录入命令，便于只改一个
@@ -217,6 +220,101 @@ func TestCLISameNumberSameContentReturnsOriginalAndKeepsFirstSaveTime(t *testing
 	if len(rv.History) != 1 || rv.Latest == nil ||
 		rv.Latest.Number != "C-1" || rv.Latest.CreatedAt != firstSave {
 		t.Fatalf("核对中历史应只有一张且最近证书录入时间不变：%+v", rv)
+	}
+}
+
+// TestCLISameNumberLocalDateMovedBackward 从命令行黑盒覆盖本机日期回拨场景：
+// 证书合法保存后，本机日期回拨使当前日历日期落到证书校准日期之前（这里把
+// 台账中证书的校准日期改到明天来确定性模拟）。同号同内容重交退出 0、普通
+// 输出明确返回原证书且未增加历史、JSON 标明重复并返回原证书（录入时间保留
+// 首次保存值）；同号不同内容退出 1、JSON 标明未接受且属于冲突、不返回证书；
+// 台账中不存在的新编号、校准日期仍晚于本机今天继续被拒绝，不新增证书、不
+// 占用编号；器具核对中仍只有原来那张历史证书，最近证书不变。
+func TestCLISameNumberLocalDateMovedBackward(t *testing.T) {
+	dir := chdirTemp(t)
+	path := filepath.Join(dir, "台账.json")
+	registerAllowed(t, path, "M-1", "0.5")
+	registerAllowed(t, path, "M-2", "1")
+
+	now := time.Now()
+	cal := now.Format(calibrate.DateLayout)
+	future := now.AddDate(1, 0, 0).Format(calibrate.DateLayout)
+	args := sameNumberCertArgs(path, "M-1", "C-1", cal, future, "规范A", "0.1", "摘要")
+	if r := runArgs(t, args...); r.code != 0 {
+		t.Fatalf("首次录入失败 code=%d stderr=%s", r.code, r.stderr)
+	}
+	want := readPersistedCerts(t, path)[0]
+
+	// 模拟“首次录入后本机日期回拨”：台账中证书的校准日期变为明天，即晚于
+	// 当前本机日期；重交内容与之保持一致。
+	movedCal := now.AddDate(0, 0, 1).Format(calibrate.DateLayout)
+	movedExpiry := now.AddDate(1, 0, 1).Format(calibrate.DateLayout)
+	rewritePersistedCertField(t, path, "C-1", "cal_date", movedCal)
+	rewritePersistedCertField(t, path, "C-1", "expiry", movedExpiry)
+	moved := sameNumberCertArgs(path, "M-1", "C-1", movedCal, movedExpiry, "规范A", "0.1", "摘要")
+
+	// 同号同内容：退出 0，明确返回原证书、未增加历史。
+	human := runArgs(t, moved...)
+	if human.code != 0 ||
+		!strings.Contains(human.stdout, "同号证书且内容一致，返回原证书，未增加历史记录") {
+		t.Fatalf("同号同内容应退出 0 并返回原证书：code=%d stdout=%q stderr=%s",
+			human.code, human.stdout, human.stderr)
+	}
+	js, resp := runCertCLIJSON(t, moved)
+	if js.code != 0 || !resp.Accepted || !resp.Duplicate || resp.Conflict ||
+		resp.Certificate == nil {
+		t.Fatalf("JSON 应退出 0、标明重复并返回原证书：code=%d resp=%+v", js.code, resp)
+	}
+	if resp.Certificate.CreatedAt != want.CreatedAt || resp.Certificate.CalDate != movedCal {
+		t.Fatalf("应返回原证书且录入时间保留首次值 %s：%+v", want.CreatedAt, resp.Certificate)
+	}
+	if certs := readPersistedCerts(t, path); len(certs) != 1 {
+		t.Fatalf("重复提交不能新增证书：%+v", certs)
+	}
+
+	// 同号不同内容（方法、摘要、测得误差分别变化）：退出 1，明确冲突而非未来
+	// 日期，JSON 标明未接受且属于冲突，不返回证书，原证书不被覆盖。
+	for _, changed := range [][]string{
+		sameNumberCertArgs(path, "M-1", "C-1", movedCal, movedExpiry, "规范B", "0.1", "摘要"),
+		sameNumberCertArgs(path, "M-1", "C-1", movedCal, movedExpiry, "规范A", "0.1", "另一份摘要"),
+		sameNumberCertArgs(path, "M-1", "C-1", movedCal, movedExpiry, "规范A", "0.2", "摘要"),
+	} {
+		ch := runArgs(t, changed...)
+		if ch.code != 1 || !strings.Contains(ch.stderr, "已拒绝") ||
+			!strings.Contains(ch.stderr, "内容不同") {
+			t.Fatalf("同号不同内容应冲突退出 1：code=%d stderr=%q", ch.code, ch.stderr)
+		}
+		if strings.Contains(ch.stderr, "不能晚于本机今天") {
+			t.Fatalf("同号不同内容不能报未来日期：%q", ch.stderr)
+		}
+		cj, cresp := runCertCLIJSON(t, changed)
+		if cj.code != 1 || cresp.Accepted || !cresp.Conflict || cresp.Certificate != nil {
+			t.Fatalf("JSON 应退出 1、标明冲突且不返回证书：code=%d resp=%+v", cj.code, cresp)
+		}
+	}
+	certs := readPersistedCerts(t, path)
+	if len(certs) != 1 || certs[0].Method != "规范A" ||
+		certs[0].Summary != "摘要" || certs[0].Error != 0.1 {
+		t.Fatalf("冲突提交不得改动原证书：%+v", certs)
+	}
+
+	// 新编号、校准日期晚于本机今天：继续被拒绝，不新增证书、不占用编号。
+	fresh := sameNumberCertArgs(path, "M-2", "C-2", movedCal, movedExpiry, "规范A", "0.1", "摘要")
+	fr, fresp := runCertCLIJSON(t, fresh)
+	if fr.code != 1 || fresp.Accepted || fresp.Conflict ||
+		!strings.Contains(fr.stderr, "不能晚于本机今天") {
+		t.Fatalf("新编号未来日期应被拒绝：code=%d resp=%+v stderr=%s",
+			fr.code, fresp, fr.stderr)
+	}
+	if certs := readPersistedCerts(t, path); len(certs) != 1 || certs[0].Number != "C-1" {
+		t.Fatalf("被拒绝的新编号不能留下证书：%+v", certs)
+	}
+
+	// 器具核对中仍只有原来那张历史证书，最近证书的选择不变。
+	rv := reviewSameNumberJSON(t, path, "M-1")
+	if len(rv.History) != 1 || rv.Latest == nil || rv.Latest.Number != "C-1" ||
+		rv.Latest.CreatedAt != want.CreatedAt {
+		t.Fatalf("核对中历史与最近证书应保持不变：%+v", rv)
 	}
 }
 
