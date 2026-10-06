@@ -372,6 +372,14 @@ type CertificateInput struct {
 // AddCertificate 录入一张校准证书并返回它；若同号证书且全部业务字段一致，
 // 返回原证书且不增加历史（幂等）。同号内容不同报冲突且不改动已有数据。
 //
+// 同号判定优先于“校准日期不能晚于本机今天”：证书首次录入时内容合法且已
+// 成功保存，之后本机调整时区或日期、使当前日历日期落到该证书校准日期
+// 之前，再原样提交同号证书仍幂等成功并返回首次保存的原证书（保留首次
+// 录入时间，不新增历史、不切换器具状态、不新增使用申请）；同号但修改了
+// 校准方法、摘要或测得误差等任一字段时，仍报同号内容冲突而不是未来日期
+// 错误，原证书不被覆盖。只有台账中不存在的新编号才受“校准日期不能晚于
+// 本机今天”约束，本机日期正常推进时的新录入行为保持不变。
+//
 // 返回的证书只是本次已保存内容的展示副本，与台账内存储不共享内存：调用方
 // 整理返回结果中的误差、截止日、编号或其他字段，不会改写台账里的正式证书，
 // 不影响最近证书的选择、使用资格判断与编号占用，也不会被此后的写盘带入文件；
@@ -415,15 +423,15 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 	if err != nil {
 		return nil, false, err
 	}
-	// 与“本机今天”按日历日期比较，避免时分秒和时区造成边界误差。
-	todayText := l.now().Format(DateLayout)
-	if calText > todayText {
-		return nil, false, validationError("校准日期 %s 不能晚于本机今天 %s", calText, todayText)
-	}
 	if expText <= calText {
 		return nil, false, validationError("有效期截止日 %s 必须晚于校准日期 %s", expText, calText)
 	}
 
+	// 同号判定优先于“校准日期不能晚于本机今天”：证书首次保存时内容合法，
+	// 之后本机日期（含时区调整）回落到该证书校准日期之前，同号提交仍应按
+	// 已有证书处理——内容一致幂等返回原证书，内容不同报冲突；本机日期变化
+	// 不能让已有证书的重复提交变成一次失败的新录入。未来日期限制只约束
+	// 台账中不存在的新证书编号。
 	if existing := l.findCertificate(number); existing != nil {
 		same := existing.InstrumentID == instID &&
 			existing.CalDate == calText &&
@@ -441,6 +449,13 @@ func (l *Ledger) AddCertificate(in CertificateInput) (*Certificate, bool, error)
 		return &dup, true, nil
 	}
 
+	// 与“本机今天”按日历日期比较，避免时分秒和时区造成边界误差。
+	// 新编号证书的校准日期晚于本机今天时直接拒绝：不新增证书，也不占用
+	// 该编号或该器具当天的位置。
+	todayText := l.now().Format(DateLayout)
+	if calText > todayText {
+		return nil, false, validationError("校准日期 %s 不能晚于本机今天 %s", calText, todayText)
+	}
 	// 同一器具同一天不接受两张不同编号的证书。
 	for i := range l.data.Certificates {
 		c := &l.data.Certificates[i]

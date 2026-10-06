@@ -420,7 +420,264 @@ func TestCLISameNumberSignedErrorDifferenceConflict(t *testing.T) {
 	}
 }
 
-// TestCLISameNumberConflictCannotLiftFailOrExpiryRestriction 保护冲突提交不
+// rollbackTomorrowDates 以真实运行当天为基准给出“明天”与“明年明天”的
+// 日历日期：把已保存证书的校准日期/截止日改到这两个日期，就确定性地模拟
+// 出“本机日期从校准当天回落到校准日期之前”的状态，且不依赖任何固定日期。
+func rollbackTomorrowDates(t *testing.T) (string, string) {
+	t.Helper()
+	now := time.Now()
+	return now.AddDate(0, 0, 1).Format(calibrate.DateLayout),
+		now.AddDate(1, 0, 1).Format(calibrate.DateLayout)
+}
+
+// seedCertThenRollBackClock 在当天合法录入 C-1（校准日期为运行当天），再把
+// 台账中 C-1 的校准日期与截止日改写为明天/明年明天，模拟“首次保存发生在
+// 校准当天，之后本机日历日期回到校准日期之前”。返回模拟后的日期与首次
+// 保存时的证书（录入时间保持首次保存值）。
+func seedCertThenRollBackClock(t *testing.T, path string) (cal, expiry string, first persistedCert) {
+	t.Helper()
+	now := time.Now()
+	todayCal := now.Format(calibrate.DateLayout)
+	todayExpiry := now.AddDate(1, 0, 0).Format(calibrate.DateLayout)
+	args := sameNumberCertArgs(path, "M-1", "C-1", todayCal, todayExpiry, "规范A", "0.1", "摘要")
+	if r := runArgs(t, args...); r.code != 0 {
+		t.Fatalf("首次录入失败 code=%d stderr=%s", r.code, r.stderr)
+	}
+	cal, expiry = rollbackTomorrowDates(t)
+	rewritePersistedCertField(t, path, "C-1", "cal_date", cal)
+	rewritePersistedCertField(t, path, "C-1", "expiry", expiry)
+	certs := readPersistedCerts(t, path)
+	if len(certs) != 1 {
+		t.Fatalf("前置条件失效：改写后应只有 1 张证书，得到 %+v", certs)
+	}
+	return cal, expiry, certs[0]
+}
+
+// readInstrumentStatus 直接读台账中某器具保存的状态，用来核对证书提交没有
+// 顺带切换器具状态。
+func readInstrumentStatus(t *testing.T, path, id string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取台账 %s: %v", path, err)
+	}
+	var data struct {
+		Instruments []struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"instruments"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil {
+		t.Fatalf("解析台账 %s: %v", path, err)
+	}
+	for _, in := range data.Instruments {
+		if in.ID == id {
+			return in.Status
+		}
+	}
+	t.Fatalf("台账中找不到器具 %s", id)
+	return ""
+}
+
+// TestCLISameNumberAfterClockRollbackSameContentReturnsOriginal 从命令行守住
+// 主场景：首次合法保存后本机日历日期回到校准日期之前，原样提交同号同内容
+// 仍退出 0、明确返回原证书且未增加历史；JSON 保留 duplicate=true 与原证书
+// 内容（含首次录入时间）。不切换器具状态、不新增使用申请，核对中历史与
+// 最近证书仍是原来那一张。
+func TestCLISameNumberAfterClockRollbackSameContentReturnsOriginal(t *testing.T) {
+	dir := chdirTemp(t)
+	path := filepath.Join(dir, "台账.json")
+	registerAllowed(t, path, "M-1", "0.5")
+	cal, expiry, first := seedCertThenRollBackClock(t, path)
+	args := sameNumberCertArgs(path, "M-1", "C-1", cal, expiry, "规范A", "0.1", "摘要")
+
+	// 普通输出：退出 0，明确重复、返回原证书，而不是报未来日期或录入新证书。
+	human := runArgs(t, args...)
+	if human.code != 0 {
+		t.Fatalf("日期回落后同号同内容应退出 0，得到 %d（stderr=%s）",
+			human.code, human.stderr)
+	}
+	if !strings.Contains(human.stdout, "同号证书且内容一致，返回原证书，未增加历史记录") {
+		t.Fatalf("普通输出应明确返回原证书且未增加历史：%q", human.stdout)
+	}
+	if strings.Contains(human.stdout, "已录入新证书") {
+		t.Fatalf("重复提交不能被说成录入新证书：%q", human.stdout)
+	}
+	if strings.Contains(human.stderr, "不能晚于本机今天") {
+		t.Fatalf("同号同内容不能报未来日期：%q", human.stderr)
+	}
+
+	// JSON：退出 0、accepted=true、duplicate=true、conflict=false，原证书
+	// 内容与首次录入时间不变。
+	js, resp := runCertCLIJSON(t, args)
+	if js.code != 0 {
+		t.Fatalf("JSON 应退出 0，得到 %d（stderr=%s）", js.code, js.stderr)
+	}
+	if !resp.Accepted || !resp.Duplicate || resp.Conflict || resp.Certificate == nil {
+		t.Fatalf("JSON 应 accepted=true duplicate=true conflict=false 且返回原证书：%+v", resp)
+	}
+	if *resp.Certificate != first {
+		t.Fatalf("JSON 应返回首次保存的原证书：got=%+v want=%+v", *resp.Certificate, first)
+	}
+
+	// 历史仍只有原来那一张；录入时间保留首次值；最近证书也是它。
+	certs := readPersistedCerts(t, path)
+	if len(certs) != 1 || certs[0] != first {
+		t.Fatalf("重复提交不得改动台账：got=%+v want=%+v", certs, first)
+	}
+	rv := reviewSameNumberJSON(t, path, "M-1")
+	if len(rv.History) != 1 || rv.Latest == nil ||
+		rv.Latest.Number != "C-1" || rv.Latest.CreatedAt != first.CreatedAt {
+		t.Fatalf("核对中历史应只有一张且最近证书不变：%+v", rv)
+	}
+
+	// 不切换器具状态、不新增使用申请或历史拒绝原因。
+	if got := readInstrumentStatus(t, path, "M-1"); got != string(calibrate.StatusPending) {
+		t.Fatalf("重复提交不得切换器具状态，得到 %q", got)
+	}
+	if n := readUsageCount(t, path); n != 0 {
+		t.Fatalf("重复提交不得新增使用申请，得到 %d 条", n)
+	}
+	if rv.CanUse {
+		t.Fatalf("待校准器具不应因重复提交变得可以使用：%+v", rv.Reasons)
+	}
+}
+
+// TestCLINewNumberFutureCalDateStillRejectedAfterClockRollback 守住另一侧：
+// 日期回落不能放宽对新编号的未来日期限制。校准日期为明天的新证书必须继续
+// 退出 1、JSON conflict=false（普通业务拒绝而非同号冲突），不新增证书、
+// 不占用编号；改用当天日期提交同一新编号则正常录入。
+func TestCLINewNumberFutureCalDateStillRejectedAfterClockRollback(t *testing.T) {
+	dir := chdirTemp(t)
+	path := filepath.Join(dir, "台账.json")
+	registerAllowed(t, path, "M-1", "0.5")
+	cal, expiry, first := seedCertThenRollBackClock(t, path)
+	future := sameNumberCertArgs(path, "M-1", "C-NEW", cal, expiry, "规范A", "0.1", "摘要")
+
+	// 普通输出：退出 1，以“已拒绝”说明晚于本机今天，而不是编号冲突。
+	human := runArgs(t, future...)
+	if human.code != 1 {
+		t.Fatalf("新编号未来校准日期应退出 1，得到 %d", human.code)
+	}
+	if !strings.Contains(human.stderr, "已拒绝") ||
+		!strings.Contains(human.stderr, "不能晚于本机今天") {
+		t.Fatalf("普通输出应说明校准日期晚于本机今天：%q", human.stderr)
+	}
+	if strings.Contains(human.stderr, "内容不同") {
+		t.Fatalf("新编号未来日期不能报成同号内容冲突：%q", human.stderr)
+	}
+
+	// JSON：退出 1、accepted=false、conflict=false，不返回录入成功的证书。
+	jr, jresp := runCertCLIJSON(t, future)
+	if jr.code != 1 || jresp.Accepted || jresp.Conflict || jresp.Duplicate {
+		t.Fatalf("JSON 应明确未接受且属于普通校验拒绝（conflict=false）：code=%d %+v",
+			jr.code, jresp)
+	}
+	if !strings.Contains(jresp.Error, "不能晚于本机今天") {
+		t.Fatalf("JSON 错误原因应为未来日期：%q", jresp.Error)
+	}
+	if strings.Contains(jr.stdout, `"certificate"`) {
+		t.Fatalf("未来日期拒绝时不得返回证书：%s", jr.stdout)
+	}
+
+	// 不新增证书、不占用编号：台账仍只有 C-1 且内容不变。
+	certs := readPersistedCerts(t, path)
+	if len(certs) != 1 || certs[0] != first {
+		t.Fatalf("未来日期拒绝不得改动台账：got=%+v want=%+v", certs, first)
+	}
+
+	// 同一新编号改用运行当天日期（与已存 C-1 的明天不同日）应正常录入，
+	// 证明编号未被占用，本机日期正常推进时的录入行为保持不变。
+	now := time.Now()
+	todayCal := now.Format(calibrate.DateLayout)
+	todayExpiry := now.AddDate(1, 0, 0).Format(calibrate.DateLayout)
+	okArgs := sameNumberCertArgs(path, "M-1", "C-NEW", todayCal, todayExpiry, "规范A", "0.1", "摘要")
+	sr, sresp := runCertCLIJSON(t, okArgs)
+	if sr.code != 0 || !sresp.Accepted || sresp.Duplicate || sresp.Certificate == nil {
+		t.Fatalf("新编号改用当天日期应正常录入：code=%d resp=%+v stderr=%s",
+			sr.code, sresp, sr.stderr)
+	}
+	if n := len(readPersistedCerts(t, path)); n != 2 {
+		t.Fatalf("正常录入后台账应有 2 张证书，得到 %d 张", n)
+	}
+}
+
+// TestCLISameNumberDifferentContentAfterClockRollbackConflict 守住冲突方向：
+// 原证书校准日期晚于当前本机日期时，同号提交内容本身合法但修改了校准方法、
+// 摘要或测得误差，必须退出 1 且 JSON conflict=true（而不是未来日期的普通
+// 校验拒绝或重复成功），原证书不被覆盖；随后原样重交仍幂等成功。
+func TestCLISameNumberDifferentContentAfterClockRollbackConflict(t *testing.T) {
+	cases := []struct {
+		name    string
+		method  string
+		errVal  string
+		summary string
+	}{
+		{"校准方法改成另一个非空方法", "规范B", "0.1", "摘要"},
+		{"摘要改成另一段非空摘要", "规范A", "0.1", "另一份摘要"},
+		{"方法内部空白变化", "规范 A", "0.1", "摘要"},
+		{"摘要内部空白变化", "规范A", "0.1", "摘 要"},
+		{"测得误差改成另一个有限数值", "规范A", "0.2", "摘要"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := chdirTemp(t)
+			path := filepath.Join(dir, "台账.json")
+			registerAllowed(t, path, "M-1", "0.5")
+			cal, expiry, first := seedCertThenRollBackClock(t, path)
+			changed := sameNumberCertArgs(path, "M-1", "C-1", cal, expiry,
+				tc.method, tc.errVal, tc.summary)
+
+			// 普通输出：退出 1，以“已拒绝”说明内容冲突，而不是未来日期。
+			human := runArgs(t, changed...)
+			if human.code != 1 {
+				t.Fatalf("同号内容变化应退出 1，得到 %d", human.code)
+			}
+			if !strings.Contains(human.stderr, "已拒绝") ||
+				!strings.Contains(human.stderr, "C-1") ||
+				!strings.Contains(human.stderr, "内容不同") {
+				t.Fatalf("普通输出应说明证书 C-1 内容冲突：%q", human.stderr)
+			}
+			if strings.Contains(human.stderr, "不能晚于本机今天") {
+				t.Fatalf("同号内容变化不能报成未来日期：%q", human.stderr)
+			}
+
+			// JSON：退出 1、accepted=false、conflict=true，不返回证书。
+			jr, jresp := runCertCLIJSON(t, changed)
+			if jr.code != 1 || jresp.Accepted || !jresp.Conflict || jresp.Certificate != nil {
+				t.Fatalf("JSON 应明确未接受且属于冲突：code=%d resp=%+v", jr.code, jresp)
+			}
+
+			// 原证书不被覆盖；历史与最近证书仍是原来那一张；状态与使用记录不变。
+			certs := readPersistedCerts(t, path)
+			if len(certs) != 1 || certs[0] != first {
+				t.Fatalf("冲突提交不得改动原证书：got=%+v want=%+v", certs, first)
+			}
+			rv := reviewSameNumberJSON(t, path, "M-1")
+			if len(rv.History) != 1 || rv.Latest == nil || rv.Latest.Number != "C-1" {
+				t.Fatalf("冲突后历史与最近证书应不变：%+v", rv)
+			}
+			if got := readInstrumentStatus(t, path, "M-1"); got != string(calibrate.StatusPending) {
+				t.Fatalf("冲突提交不得切换器具状态，得到 %q", got)
+			}
+			if n := readUsageCount(t, path); n != 0 {
+				t.Fatalf("冲突提交不得新增使用申请，得到 %d 条", n)
+			}
+
+			// 控制对照：原样重交仍幂等成功，保留首次录入时间。
+			again := sameNumberCertArgs(path, "M-1", "C-1", cal, expiry, "规范A", "0.1", "摘要")
+			ar, aresp := runCertCLIJSON(t, again)
+			if ar.code != 0 || !aresp.Accepted || !aresp.Duplicate ||
+				aresp.Certificate == nil || *aresp.Certificate != first {
+				t.Fatalf("原样重交应幂等返回原证书：code=%d resp=%+v", ar.code, aresp)
+			}
+			if n := len(readPersistedCerts(t, path)); n != 1 {
+				t.Fatalf("整轮操作后应仍只有 1 张证书，得到 %d 张", n)
+			}
+		})
+	}
+}
+
 // 能改变使用资格：原证书超差时改成合格值重交、原证书已到期时改成未来截止
 // 日重交，内容本身都合法，但只能报编号冲突；按器具核对看到的结论、历史
 // 数量、最近证书与使用限制都与提交前一致，同号证书不会被换内容而生效。

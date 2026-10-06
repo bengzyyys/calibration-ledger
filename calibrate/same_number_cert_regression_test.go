@@ -293,6 +293,187 @@ func TestSameNumberSignedErrorDifferenceIsConflictEvenWhenVerdictSame(t *testing
 	assertStoredCertIntact(t, l, *first)
 }
 
+// rollbackBaseInput 构造一张校准日期为 2026-10-06 的证书：配合把假时钟
+// 从 2026-10-06 拨回 2026-10-05，模拟“首次录入合法保存后本机日期回到
+// 校准日期之前”。
+func rollbackBaseInput(number string) CertificateInput {
+	return CertificateInput{
+		InstrumentID: "M-1", Number: number, CalDate: "2026-10-06",
+		Expiry: "2027-10-06", Method: "规范A", Error: 0.1, Summary: "摘要",
+	}
+}
+
+// setupRolledBackLedger 在本机日期 2026-10-06 成功录入 C-1（校准日期同为
+// 2026-10-06），再把本机日期拨回 2026-10-05，返回假时钟、台账与首次保存
+// 的原证书。
+func setupRolledBackLedger(t *testing.T) (*fakeClock, *Ledger, Certificate) {
+	t.Helper()
+	clock, l := setupSameNumberLedger(t, mustDate(t, "2026-10-06"))
+	in := rollbackBaseInput("C-1")
+	first, dup, err := l.AddCertificate(in)
+	if err != nil || dup || first == nil {
+		t.Fatalf("2026-10-06 当天首次录入应作为新证书成功：err=%v dup=%v cert=%v",
+			err, dup, first)
+	}
+	clock.t = mustDate(t, "2026-10-05")
+	return clock, l, *first
+}
+
+// TestSameNumberAfterClockRollbackSameContentReturnsOriginal 守住本修复的
+// 主场景：证书首次录入时内容合法且已成功保存，之后本机日历日期回到该校准
+// 日期之前，原样提交同号同内容必须仍幂等成功——返回首次保存的原证书、
+// 标明重复、保留首次录入时间，不新增历史、不切换器具状态、不新增使用申请。
+func TestSameNumberAfterClockRollbackSameContentReturnsOriginal(t *testing.T) {
+	clock, l, first := setupRolledBackLedger(t)
+	if got := l.now().Format(DateLayout); got != "2026-10-05" {
+		t.Fatalf("前置条件失效：本机日期应为 2026-10-05，得到 %s", got)
+	}
+
+	in := rollbackBaseInput("C-1")
+	again, isDup, err := l.AddCertificate(in)
+	if err != nil || !isDup || again == nil {
+		t.Fatalf("日期回落后同号同内容应成功返回原证书而非报未来日期：err=%v dup=%v cert=%v",
+			err, isDup, again)
+	}
+	if *again != first {
+		t.Fatalf("应返回首次保存的原证书：再次 %+v，原证书 %+v", *again, first)
+	}
+	if again.CreatedAt != first.CreatedAt {
+		t.Fatalf("重复成功应保留首次录入时间 %s，得到 %s",
+			first.CreatedAt, again.CreatedAt)
+	}
+
+	// 历史仍只有原来那一张，最近证书选择不变。
+	assertStoredCertIntact(t, l, first)
+
+	// 重复提交不切换器具状态、不新增使用申请或历史拒绝原因。
+	if inst := l.findInstrument("M-1"); inst.Status != StatusPending {
+		t.Fatalf("重复提交不得切换器具状态，得到 %s", inst.Status)
+	}
+	if len(l.data.Usage) != 0 {
+		t.Fatalf("重复提交不得新增使用申请，得到 %d 条", len(l.data.Usage))
+	}
+
+	// 日期继续正常推进到 2026-10-07 后，同号同内容仍是幂等重复。
+	clock.t = mustDate(t, "2026-10-07")
+	later, isDup, err := l.AddCertificate(in)
+	if err != nil || !isDup || later == nil || *later != first {
+		t.Fatalf("日期推进后同号同内容仍应幂等返回原证书：err=%v dup=%v cert=%+v",
+			err, isDup, later)
+	}
+	assertStoredCertIntact(t, l, first)
+}
+
+// TestNewNumberFutureCalDateStillRejectedAfterClockRollback 守住另一侧：
+// 日期回落不能放宽对“新编号”的未来日期限制。校准日期晚于本机今天的新
+// 证书必须继续因未来日期被拒（普通校验错误而非冲突），不新增证书、不
+// 占用编号；改用不晚于今天的日期重交同一编号应能正常录入，当天补录与
+// 日期推进后的正常录入行为保持不变。
+func TestNewNumberFutureCalDateStillRejectedAfterClockRollback(t *testing.T) {
+	_, l, first := setupRolledBackLedger(t)
+
+	future := rollbackBaseInput("C-NEW")
+	cert, dup, err := l.AddCertificate(future)
+	if err == nil {
+		t.Fatalf("台账中不存在的新编号校准日期晚于今天必须被拒，却返回 %+v（dup=%v）",
+			cert, dup)
+	}
+	if !IsValidation(err) {
+		t.Fatalf("新编号未来日期应报普通校验错误，得到 %v", err)
+	}
+	if IsConflict(err) {
+		t.Fatalf("新编号未来日期不能被报成同号冲突：%v", err)
+	}
+	if !strings.Contains(err.Error(), "不能晚于本机今天") ||
+		!strings.Contains(err.Error(), "2026-10-05") {
+		t.Fatalf("拒绝原因应说明晚于本机今天 2026-10-05，得到 %q", err.Error())
+	}
+	if cert != nil || dup {
+		t.Fatalf("被拒时不得返回证书或重复标记：cert=%v dup=%v", cert, dup)
+	}
+	if l.findCertificate("C-NEW") != nil {
+		t.Fatal("被拒的未来证书不得占用编号 C-NEW")
+	}
+	assertStoredCertIntact(t, l, first)
+
+	// 同一新编号改用不晚于今天（2026-10-05）的日期：正常录入，证明编号
+	// 未被占用，且当天录入功能保持原有行为（与原证书不同日，不触同日限制）。
+	today := future
+	today.CalDate = "2026-10-05"
+	today.Expiry = "2027-10-05"
+	saved, isDup, err := l.AddCertificate(today)
+	if err != nil || isDup || saved == nil {
+		t.Fatalf("新编号改用当天日期应正常录入：err=%v dup=%v cert=%v",
+			err, isDup, saved)
+	}
+	if saved.Number != "C-NEW" || saved.CalDate != "2026-10-05" {
+		t.Fatalf("新证书内容异常：%+v", saved)
+	}
+	if n := len(l.data.Certificates); n != 2 {
+		t.Fatalf("正常录入后台账应有 2 张证书，得到 %d 张", n)
+	}
+}
+
+// TestSameNumberDifferentContentAfterClockRollbackIsConflict 守住冲突方向：
+// 原证书校准日期晚于当前本机日期时，同号提交虽满足非空、真实日期、有限
+// 数值及器具存在等要求，但修改了校准方法、摘要或测得误差，必须报同号
+// 内容冲突（而不是未来日期错误或重复成功），原证书不得被覆盖。
+func TestSameNumberDifferentContentAfterClockRollbackIsConflict(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*CertificateInput)
+	}{
+		{"校准方法改成另一个非空方法", func(c *CertificateInput) { c.Method = "规范B" }},
+		{"摘要改成另一段非空摘要", func(c *CertificateInput) { c.Summary = "另一份摘要" }},
+		{"方法内部空白变化", func(c *CertificateInput) { c.Method = "规范 A" }},
+		{"摘要内部空白变化", func(c *CertificateInput) { c.Summary = "摘 要" }},
+		{"测得误差改成另一个有限数值", func(c *CertificateInput) { c.Error = 0.2 }},
+		{"有效期截止日换成更晚日期", func(c *CertificateInput) { c.Expiry = "2028-10-06" }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, l, first := setupRolledBackLedger(t)
+			changed := rollbackBaseInput("C-1")
+			tc.mut(&changed)
+
+			cert, dup, err := l.AddCertificate(changed)
+			if err == nil {
+				t.Fatalf("同号内容变化必须被拒绝，却返回 %+v（dup=%v）", cert, dup)
+			}
+			if !IsConflict(err) {
+				t.Fatalf("应报同号内容冲突，而不是未来日期或普通输入无效：%v", err)
+			}
+			if strings.Contains(err.Error(), "不能晚于本机今天") {
+				t.Fatalf("同号内容变化不能报成未来日期错误：%v", err)
+			}
+			if !strings.Contains(err.Error(), "C-1") ||
+				!strings.Contains(err.Error(), "内容不同") {
+				t.Fatalf("冲突信息应指出编号与内容不同，得到 %q", err.Error())
+			}
+			if cert != nil || dup {
+				t.Fatalf("冲突时不得返回成功或重复证书：cert=%v dup=%v", cert, dup)
+			}
+			assertStoredCertIntact(t, l, first)
+
+			// 冲突同样不切换状态、不留使用申请。
+			if inst := l.findInstrument("M-1"); inst.Status != StatusPending {
+				t.Fatalf("冲突提交不得切换器具状态，得到 %s", inst.Status)
+			}
+			if len(l.data.Usage) != 0 {
+				t.Fatalf("冲突提交不得新增使用申请，得到 %d 条", len(l.data.Usage))
+			}
+
+			// 控制对照：原样重交仍应幂等成功。
+			again, isDup, err := l.AddCertificate(rollbackBaseInput("C-1"))
+			if err != nil || !isDup || again == nil || *again != first {
+				t.Fatalf("原样重交应幂等返回原证书：err=%v dup=%v cert=%+v",
+					err, isDup, again)
+			}
+			assertStoredCertIntact(t, l, first)
+		})
+	}
+}
+
 // TestSameNumberConflictUntouchedAfterReopen 保护“冲突不写盘”跨进程成立：
 // 首次证书保存进文件后，连续发起多次同号内容不同的提交（全部被冲突拒绝），
 // 用同一时刻重新打开台账文件，原证书全部内容、历史数量与最近证书选择仍与
