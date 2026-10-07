@@ -261,6 +261,35 @@ type RegisterInput struct {
 	AllowedError float64
 }
 
+// saveInstruments 是器具登记与状态切换共用的一条规则：只有本次保存成功，
+// 器具信息的改动才算正式生效。它在整份器具切片的独立副本上暂存 change 对
+// 器具信息的修改（新增器具或改动已有器具字段都一样），只有原子替换台账文件
+// 成功后才提交；写盘失败时恢复原切片并明确返回保存错误，保证同一台账对象
+// 随后的列出、按编号核对、编号占用判断、待办与使用资格判断都与修改前完全
+// 一致——失败的新器具或目标状态既不会提前生效或占用编号，也不会在此后其他
+// 成功操作写盘时被顺带写入。保存成功后返回 id 指定器具已保存内容的独立展示
+// 副本：调用方改动这份结果不能改写正式台账。
+//
+// 调用方必须先完成全部业务校验再进入这里：重复编号、非法状态或未知器具等
+// 未通过业务校验的申请按原有原因拒绝，不会走到写盘而被混成保存失败；目标
+// 状态本来就与正式状态相同这类无需改动的情形，也由调用方在进入前直接成功
+// 跳过，不额外写盘。
+func (l *Ledger) saveInstruments(id string, change func(*[]Instrument)) (*Instrument, error) {
+	original := l.data.Instruments
+	// 独立副本与原切片不共享底层数组：change 的暂存修改不会提前渗进正式
+	// 台账，写盘失败时恢复原切片即可。
+	staged := make([]Instrument, len(original))
+	copy(staged, original)
+	change(&staged)
+	l.data.Instruments = staged
+	if err := l.save(); err != nil {
+		l.data.Instruments = original
+		return nil, err
+	}
+	saved := *l.findInstrument(id)
+	return &saved, nil
+}
+
 // Register 登记一件新器具。编号、名称不得为空白，允许误差必须是不小于零的
 // 有限数；编号重复或输入无效时明确拒绝，原记录不变。新器具处于待校准状态。
 //
@@ -298,21 +327,11 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 		Status:       StatusPending,
 		RegisteredAt: l.now().Format(time.RFC3339),
 	}
-	// 在独立的新切片上暂存新器具：只有原子替换台账文件成功后才提交。
-	// 写盘失败时恢复原切片，保证同一台账对象随后的列出、按编号核对与编号
-	// 占用判断都与登记前一致，失败器具也不会被之后的写盘顺带写入。
-	original := l.data.Instruments
-	staged := make([]Instrument, 0, len(original)+1)
-	staged = append(staged, original...)
-	staged = append(staged, inst)
-	l.data.Instruments = staged
-	if err := l.save(); err != nil {
-		l.data.Instruments = original
-		return nil, err
-	}
-	// 返回已保存器具的独立副本：返回结果只表示本次保存成功的内容。
-	saved := *l.findInstrument(id)
-	return &saved, nil
+	// 在独立的新切片上暂存新器具：只有原子替换台账文件成功后才提交，
+	// 保存规则见 saveInstruments。
+	return l.saveInstruments(id, func(staged *[]Instrument) {
+		*staged = append(*staged, inst)
+	})
 }
 
 // SetStatus 切换器具状态。切换为在用不代表已校准；停用不删除证书与使用记录。
@@ -338,24 +357,16 @@ func (l *Ledger) SetStatus(id string, status Status) error {
 		return nil
 	}
 	// 在整份器具切片的独立副本上暂存新状态：只有原子替换台账文件成功后才
-	// 提交。写盘失败时恢复原切片，保证同一台账对象随后看到的器具状态、列出
-	// 结果、待办与使用判断都与切换前一致；再次提交相同状态仍会走到保存，
-	// 失败状态也不会被之后的写盘顺带写入。
-	original := l.data.Instruments
-	staged := make([]Instrument, len(original))
-	copy(staged, original)
-	for i := range staged {
-		if staged[i].ID == id {
-			staged[i].Status = status
-			break
+	// 提交，保存规则见 saveInstruments。
+	_, err := l.saveInstruments(id, func(staged *[]Instrument) {
+		for i := range *staged {
+			if (*staged)[i].ID == id {
+				(*staged)[i].Status = status
+				break
+			}
 		}
-	}
-	l.data.Instruments = staged
-	if err := l.save(); err != nil {
-		l.data.Instruments = original
-		return err
-	}
-	return nil
+	})
+	return err
 }
 
 // CertificateInput 是录入校准证书的输入。
