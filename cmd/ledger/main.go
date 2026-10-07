@@ -119,10 +119,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 			businessArgs = append(businessArgs, a)
-			// 业务标志不带等号时，下一个参数是它的字段值：原样一并转交子命令，
-			// 绝不再按全局参数解释（与 flag 包对字符串标志的取值行为一致）。
+			// 已知需要值的业务标志不带等号时，下一个参数是它的字段值：原样一并
+			// 转交子命令，绝不再按全局参数解释（与 flag 包对字符串标志的取值
+			// 行为一致）。未知标志不吞掉后续参数——它本身与其后的内容都作为
+			// 多余参数交给子命令报参数错误，避免静默吃掉用户给出的证书内容。
 			// 值缺失时不在这里补，由子命令解析时报“标志需要值”。
-			if strings.HasPrefix(a, "-") && !strings.Contains(a, "=") && i+1 < len(args) {
+			if strings.HasPrefix(a, "-") && !strings.Contains(a, "=") &&
+				knownValueFlags[cmd][strings.TrimLeft(a, "-")] && i+1 < len(args) {
 				i++
 				businessArgs = append(businessArgs, args[i])
 			}
@@ -191,6 +194,82 @@ func newFlagSet(name string, opts *options) *flag.FlagSet {
 	fs.SetOutput(io.Discard)
 	fs.BoolVar(&opts.asJSON, "json", opts.asJSON, "以 JSON 输出")
 	return fs
+}
+
+// knownValueFlags 列出每个子命令“需要一个值”的业务标志名（不含前导横线）。
+// 全局预扫描据此判断标志后的参数是不是它的字段值；未知标志不得吞掉后续
+// 参数，否则未登记的写法会让后面的证书内容被静默忽略。
+var knownValueFlags = map[string]map[string]bool{
+	"register":   {"id": true, "name": true, "allowed": true},
+	"status":     {"id": true, "status": true},
+	"cert":       {"instrument": true, "number": true, "cal-date": true, "expiry": true, "method": true, "error": true, "summary": true},
+	"use":        {"id": true},
+	"review":     {"id": true},
+	"plan":       {"instrument": true, "number": true, "date": true, "note": true},
+	"reschedule": {"number": true, "date": true, "reason": true},
+	"cancel":     {"number": true, "reason": true},
+	"complete":   {"number": true, "certificate": true},
+	"todos":      {"instrument": true},
+}
+
+// parseStrictFlags 严格解析子命令参数：只接受 names 中登记的标志，且不允许
+// 任何游离于字段之外的独立参数。标准库 flag 遇到第一个位置参数就停止解析、
+// 静默丢弃其后全部内容，无法满足“多一个普通参数即整次录入失败”的要求，
+// 因此这里自行扫描。
+//
+// 规则：
+//   - --name value 与 --name=value 两种写法等价；需要值的标志悬在末尾或缺值
+//     时返回参数错误。
+//   - 值原样接收，可以包含空格，也可以恰好是 --json、-f备用.json 等文字，
+//     这些只属于字段内容。
+//   - 单独的 -- 终止标志解析：其后若还有任何独立参数，一律按多余参数拒绝；
+//     只有结束符而没有后续内容时合法。
+//   - 未登记的标志（如 --bogus）与任何普通词都是多余参数，返回错误并附上
+//     至少一个具体内容，错误信息前缀“cert 参数错误：”等由调用方包装。
+//
+// “--” 本身计入 consumed，使返回的 leftover 只剩 -- 之后真正多余的内容。
+func parseStrictFlags(args []string, names map[string]bool) (values map[string]string, leftover []string, err error) {
+	values = map[string]string{}
+	afterDashDash := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if afterDashDash {
+			leftover = append(leftover, a)
+			continue
+		}
+		if a == "--" {
+			afterDashDash = true
+			continue
+		}
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			leftover = append(leftover, a)
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		var raw string
+		hasEq := strings.Contains(name, "=")
+		if hasEq {
+			name, raw, _ = strings.Cut(name, "=")
+		}
+		if !names[name] {
+			// 未知标志整体作为一个多余参数，便于错误信息指出具体写法。
+			leftover = append(leftover, a)
+			continue
+		}
+		if hasEq {
+			values[name] = raw
+			continue
+		}
+		if i+1 >= len(args) {
+			return nil, nil, fmt.Errorf("标志 --%s 需要一个值", name)
+		}
+		i++
+		values[name] = args[i]
+	}
+	if len(leftover) > 0 {
+		return nil, leftover, fmt.Errorf("存在多余参数 %q（证书录入只接受已有选项及其对应值）", leftover[0])
+	}
+	return values, nil, nil
 }
 
 func parseFloat(stderr io.Writer, raw, field string) (float64, bool) {
@@ -293,22 +372,24 @@ func cmdStatus(l *calibrate.Ledger, args []string, opts options, stdout, stderr 
 }
 
 func cmdCert(l *calibrate.Ledger, args []string, opts options, stdout, stderr io.Writer) int {
-	fs := newFlagSet("cert", &opts)
-	instrument := fs.String("instrument", "", "器具编号")
-	number := fs.String("number", "", "证书编号（全台账唯一）")
-	calDate := fs.String("cal-date", "", "校准日期 YYYY-MM-DD")
-	expiry := fs.String("expiry", "", "有效期截止日 YYYY-MM-DD")
-	method := fs.String("method", "", "校准方法")
-	measured := fs.String("error", "", "测得误差（有限数）")
-	summary := fs.String("summary", "", "证书摘要")
-	if err := fs.Parse(args); err != nil {
+	fieldNames := map[string]bool{
+		"instrument": true, "number": true, "cal-date": true, "expiry": true,
+		"method": true, "error": true, "summary": true,
+	}
+	// 严格解析：任何没有被字段接收的独立参数（夹在中间或放在末尾、-- 之后）
+	// 都使整次录入失败，绝不替用户挑选一部分内容组成正式证书。
+	vals, _, err := parseStrictFlags(args, fieldNames)
+	if err != nil {
 		fmt.Fprintln(stderr, "cert 参数错误：", err)
 		return 2
 	}
+	instrument, number := vals["instrument"], vals["number"]
+	calDate, expiry := vals["cal-date"], vals["expiry"]
+	method, measured, summary := vals["method"], vals["error"], vals["summary"]
 	missing := []string{}
 	for k, v := range map[string]string{
-		"--instrument": *instrument, "--number": *number, "--cal-date": *calDate,
-		"--expiry": *expiry, "--method": *method, "--error": *measured, "--summary": *summary,
+		"--instrument": instrument, "--number": number, "--cal-date": calDate,
+		"--expiry": expiry, "--method": method, "--error": measured, "--summary": summary,
 	} {
 		if strings.TrimSpace(v) == "" {
 			missing = append(missing, k)
@@ -318,18 +399,18 @@ func cmdCert(l *calibrate.Ledger, args []string, opts options, stdout, stderr io
 		fmt.Fprintln(stderr, "cert 缺少必填参数：", strings.Join(missing, "、"))
 		return 2
 	}
-	measuredErr, ok := parseFloat(stderr, *measured, "测得误差")
+	measuredErr, ok := parseFloat(stderr, measured, "测得误差")
 	if !ok {
 		return 2
 	}
 	cert, duplicate, err := l.AddCertificate(calibrate.CertificateInput{
-		InstrumentID: *instrument,
-		Number:       *number,
-		CalDate:      *calDate,
-		Expiry:       *expiry,
-		Method:       *method,
+		InstrumentID: instrument,
+		Number:       number,
+		CalDate:      calDate,
+		Expiry:       expiry,
+		Method:       method,
 		Error:        measuredErr,
-		Summary:      *summary,
+		Summary:      summary,
 	})
 	if err != nil {
 		if calibrate.IsValidation(err) || calibrate.IsConflict(err) || errors.Is(err, calibrate.ErrNotFound) {
