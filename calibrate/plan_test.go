@@ -124,7 +124,8 @@ func TestRescheduleRecordsHistory(t *testing.T) {
 	if _, err := l.ReschedulePlan("NOPE", "2026-10-20", "原因"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("未知计划应报 ErrNotFound，得到 %v", err)
 	}
-	// 空白原因、过去日期、相同日期都拒绝。
+	// 空白原因、过去日期都拒绝；新日期与当前日期相同的情形不在此拒绝，
+	// 同日期改期照常留痕，见 reschedule_same_date_regression_test.go。
 	if _, err := l.ReschedulePlan("P-1", "2026-10-20", "  "); !IsValidation(err) {
 		t.Fatalf("空白原因应拒绝，得到 %v", err)
 	}
