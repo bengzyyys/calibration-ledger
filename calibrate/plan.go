@@ -204,6 +204,38 @@ func (l *Ledger) requireOpenPlan(number string) (*Plan, error) {
 	return p, nil
 }
 
+// savePlanChange 是改期、取消、完成共用的一条规则：只有本次保存成功，对已有
+// 计划的修改才算生效。它在整份计划切片的独立副本上暂存 change 对指定计划的
+// 修改，只有原子替换台账文件成功后才提交；写盘失败时恢复原切片并明确返回保存
+// 错误，保证同一台账对象随后看到的计划查询、待办与按器具核对都与修改前完全
+// 一致——计划日期、状态、改期历史、取消信息与完成信息都保持修改前的内容，
+// 失败的改动也不会被之后其他成功操作的写盘顺带写入。保存成功后返回该计划
+// 已保存内容的独立展示副本：调用方为展示而改动字段或增删、调换改期记录，
+// 不回写正式台账，也不影响此前或之后分别取得的其他结果。
+//
+// 调用方必须先完成全部业务校验再进入这里：未满足业务条件的申请按原有原因
+// 拒绝，不会走到写盘而被混成保存错误。
+func (l *Ledger) savePlanChange(number string, change func(*Plan)) (*Plan, error) {
+	original := l.data.Plans
+	staged := make([]Plan, len(original))
+	copy(staged, original)
+	for i := range staged {
+		if staged[i].Number != number {
+			continue
+		}
+		// 深拷贝改期历史：暂存副本与台账原切片不共享底层数组，change 对
+		// 改期历史的追加不会提前渗进正式台账，写盘失败时恢复原切片即可。
+		staged[i].Changes = cloneChanges(staged[i].Changes)
+		change(&staged[i])
+	}
+	l.data.Plans = staged
+	if err := l.save(); err != nil {
+		l.data.Plans = original
+		return nil, err
+	}
+	return clonePlanPtr(l.findPlan(number)), nil
+}
+
 // ReschedulePlan 改期一项未结束的计划。原因必须非空，新日期必须真实存在且
 // 不早于操作当天；每次改期保留修改前后的日期、操作时间和原因。
 // 找不到计划或计划已结束时拒绝且不改动记录。
@@ -234,36 +266,20 @@ func (l *Ledger) ReschedulePlan(number, newDate, reason string) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, err := l.requireOpenPlan(number)
-	if err != nil {
+	if _, err := l.requireOpenPlan(number); err != nil {
 		return nil, err
 	}
 	// 即使新日期与当前日期相同也照常记录：保留修改前后的日期、操作时间和原因。
-	change := PlanChange{
-		From:      p.PlannedDate,
-		To:        dateText,
-		ChangedAt: now.Format(time.RFC3339),
-		Reason:    reason,
-	}
-	// 在整份计划切片的独立副本上暂存改期：只有原子替换台账文件成功后才提交。
-	// 写盘失败时恢复原切片（含原计划日期与改期历史），保证同一台账对象随后看到的
-	// 计划日期、改期历史与待办标记都与改期前一致，且不会被之后的写盘顺带写入。
-	original := l.data.Plans
-	staged := make([]Plan, len(original))
-	copy(staged, original)
-	for i := range staged {
-		if staged[i].Number != number {
-			continue
-		}
-		staged[i].Changes = append(append([]PlanChange(nil), staged[i].Changes...), change)
-		staged[i].PlannedDate = dateText
-	}
-	l.data.Plans = staged
-	if err := l.save(); err != nil {
-		l.data.Plans = original
-		return nil, err
-	}
-	return clonePlanPtr(l.findPlan(number)), nil
+	// 从最后成功保存的日期出发追加一条记录，保存规则见 savePlanChange。
+	return l.savePlanChange(number, func(p *Plan) {
+		p.Changes = append(p.Changes, PlanChange{
+			From:      p.PlannedDate,
+			To:        dateText,
+			ChangedAt: now.Format(time.RFC3339),
+			Reason:    reason,
+		})
+		p.PlannedDate = dateText
+	})
 }
 
 // CancelPlan 取消一项未结束的计划，原因必须非空。取消后保留原计划、取消时间
@@ -291,27 +307,13 @@ func (l *Ledger) CancelPlan(number, reason string) (*Plan, error) {
 		return nil, err
 	}
 	canceledAt := l.now().Format(time.RFC3339)
-	// 在整份计划切片的独立副本上暂存取消：只有原子替换台账文件成功后才提交。
-	// 写盘失败时恢复原切片（计划仍为未完成、取消时间与原因为空），保证同一
-	// 台账对象随后看到的计划状态、待办与核对都与取消前一致，再次提交不会被
-	// 当成“已结束”，失败信息也不会被之后的写盘顺带写入。
-	original := l.data.Plans
-	staged := make([]Plan, len(original))
-	copy(staged, original)
-	for i := range staged {
-		if staged[i].Number != number {
-			continue
-		}
-		staged[i].Status = PlanStatusCanceled
-		staged[i].CanceledAt = canceledAt
-		staged[i].CancelReason = reason
-	}
-	l.data.Plans = staged
-	if err := l.save(); err != nil {
-		l.data.Plans = original
-		return nil, err
-	}
-	return clonePlanPtr(l.findPlan(number)), nil
+	// 保留原计划、取消时间和原因，按共用规则提交：保存成功才生效，
+	// 见 savePlanChange。
+	return l.savePlanChange(number, func(p *Plan) {
+		p.Status = PlanStatusCanceled
+		p.CanceledAt = canceledAt
+		p.CancelReason = reason
+	})
 }
 
 // CompletePlan 用一张台账中已有的证书完成计划。证书必须属于该器具，校准日期
@@ -401,27 +403,17 @@ func (l *Ledger) CompletePlan(number, certificateNumber string) (*Plan, bool, er
 	}
 
 	completedAt := l.now().Format(time.RFC3339)
-	// 在整份计划切片的独立副本上暂存完成：只有原子替换台账文件成功后才提交。
-	// 写盘失败时恢复原切片（计划仍为未完成、完成时间与关联证书编号为空），
-	// 保证同一台账对象随后看到的计划状态、待办与证书占用都与完成前一致，
-	// 再次提交不会被当成“此前已完成”，失败信息也不会被之后的写盘顺带写入。
-	original := l.data.Plans
-	staged := make([]Plan, len(original))
-	copy(staged, original)
-	for i := range staged {
-		if staged[i].Number != number {
-			continue
-		}
-		staged[i].Status = PlanStatusDone
-		staged[i].CompletedAt = completedAt
-		staged[i].CertificateNumber = certificateNumber
-	}
-	l.data.Plans = staged
-	if err := l.save(); err != nil {
-		l.data.Plans = original
+	// 保存完成时间和所用证书编号，按共用规则提交：保存成功才算完成，
+	// 见 savePlanChange。
+	saved, err := l.savePlanChange(number, func(p *Plan) {
+		p.Status = PlanStatusDone
+		p.CompletedAt = completedAt
+		p.CertificateNumber = certificateNumber
+	})
+	if err != nil {
 		return nil, false, err
 	}
-	return clonePlanPtr(l.findPlan(number)), false, nil
+	return saved, false, nil
 }
 
 // TodoItem 是待办查询中的一项计划及其按本机日期重新判断的标记。
