@@ -110,7 +110,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			opts.asJSON = true
 		case a == "--" && cmd != "":
 			// “--” 终止后续标志解析：其后的参数原样交给子命令
-			// （与此前 flag 包的行为一致），即使其中出现 -f 也不再视为全局参数。
+			// （与 flag 包的行为一致），即使其中出现 -f 也不再视为全局参数。
+			// 只有独立出现的 -- 才走这里；紧跟在需要值的业务标志之后时，它已在
+			// 下方默认分支被当作该标志的值，与 flag 包的取值规则保持一致。
 			businessArgs = append(businessArgs, args[i:]...)
 			i = len(args)
 		default:
@@ -303,6 +305,22 @@ func cmdCert(l *calibrate.Ledger, args []string, opts options, stdout, stderr io
 	summary := fs.String("summary", "", "证书摘要")
 	if err := fs.Parse(args); err != nil {
 		fmt.Fprintln(stderr, "cert 参数错误：", err)
+		return 2
+	}
+	// 证书录入只接受已有选项及其对应值：凡是独立传入、没有被任何选项作为值
+	// 接收的内容（无论夹在证书字段之间、放在末尾，还是位于“--”之后），都必须
+	// 让整次录入失败，不能默默丢掉一部分内容形成正式证书。flag 包会把这些内容
+	// 留在 Args 中（“--”本身被剥除，其后的参数原样保留）。检查放在任何业务
+	// 处理之前：即使字段已填齐、编号与已有证书同号同内容，也不允许录入或走
+	// 幂等返回，失败编号与该器具当天的证书位置都不会被占用。
+	if extra := fs.Args(); len(extra) > 0 {
+		quoted := make([]string, len(extra))
+		for i, a := range extra {
+			quoted[i] = strconv.Quote(a)
+		}
+		fmt.Fprintf(stderr,
+			"cert 参数错误：存在多余参数，证书录入只接受已有选项及其值，未被任何选项接收的内容：%s\n",
+			strings.Join(quoted, "、"))
 		return 2
 	}
 	missing := []string{}
