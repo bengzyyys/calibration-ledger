@@ -507,22 +507,11 @@ func (l *Ledger) plansOf(id string) []Plan {
 		}
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseInstant(out[i].CreatedAt)
-		tj, okj := parseInstant(out[j].CreatedAt)
-		switch {
-		case oki && okj:
-			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录建立时
-			// 所带的偏移及文字形式无关；时刻相同时返回 false，交由
-			// SliceStable 保留它们在台账中的原有次序。
-			return ti.Before(tj)
-		case oki != okj:
-			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
-			// 正常由本台账保存的 RFC3339 记录不会走到这里。
-			return oki
-		default:
-			// 两条都无法解析时退回按原文字比较，保证结果确定。
-			return out[i].CreatedAt < out[j].CreatedAt
-		}
+		// 时间能否识别、实际时刻比较与异常时间排列都走两处历史共用的
+		// compareHistoricalInstant；共同规则下并列（同一实际时刻，或两条
+		// 建立时间都无法识别且原文字相同）时直接返回 false，由 SliceStable
+		// 保留它们在台账中的原有次序，不按计划编号等字段再加优先级。
+		return compareHistoricalInstant(out[i].CreatedAt, out[j].CreatedAt) < 0
 	})
 	return out
 }

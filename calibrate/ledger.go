@@ -750,17 +750,6 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// parseInstant 把带偏移的 RFC3339 时间（如申请时间、计划建立时间，可带
-// 不同偏移或 Z）解析为实际时刻。不同文字形式（如 Z 与 +00:00）只要表示
-// 同一绝对时刻，解析结果即相同。
-func parseInstant(s string) (time.Time, bool) {
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
 // UsageRecords 返回全部使用申请记录，按申请发生的实际时刻从早到晚排序。
 //
 // RequestedAt 是带偏移的 RFC3339 时间：同一份台账可保存于不同系统时区偏移
@@ -780,27 +769,14 @@ func (l *Ledger) UsageRecords() []UsageRecord {
 		out[i].Reasons = cloneReasons(out[i].Reasons)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseInstant(out[i].RequestedAt)
-		tj, okj := parseInstant(out[j].RequestedAt)
-		switch {
-		case oki && okj:
-			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录保存时
-			// 所带的偏移及文字形式无关。
-			if !ti.Equal(tj) {
-				return ti.Before(tj)
-			}
-		case oki != okj:
-			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
-			// 正常由本台账保存的 RFC3339 记录不会走到这里。
-			return oki
-		default:
-			// 两条都无法解析时退回按原文字比较，保证结果确定。
-			if out[i].RequestedAt != out[j].RequestedAt {
-				return out[i].RequestedAt < out[j].RequestedAt
-			}
+		// 时间能否识别、实际时刻比较与异常时间排列都走两处历史共用的
+		// compareHistoricalInstant；共同规则下并列（同一实际时刻，或两条
+		// 时间都无法识别且原文字相同）时，使用申请再按器具编号升序；编号
+		// 也相同的同一时刻多次申请由 SliceStable 保留其在台账中的原有次序，
+		// 不因获准/拒绝结果而变动。
+		if c := compareHistoricalInstant(out[i].RequestedAt, out[j].RequestedAt); c != 0 {
+			return c < 0
 		}
-		// 实际时刻相同：按器具编号升序；编号也相同的同一时刻多次申请由
-		// SliceStable 保留其在台账中的原有次序，不因获准/拒绝结果而变动。
 		return out[i].InstrumentID < out[j].InstrumentID
 	})
 	return out
