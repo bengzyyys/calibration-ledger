@@ -254,6 +254,37 @@ func (l *Ledger) findCertificate(number string) *Certificate {
 	return nil
 }
 
+// saveInstruments 是器具登记与状态切换共用的一条规则：只有本次保存成功，
+// 对器具信息的改动才算正式写入。它在整份器具切片的独立副本上暂存 change
+// 的结果，只有原子替换台账文件成功后才提交；写盘失败时恢复原切片并明确返回
+// 保存错误，保证同一台账对象随后看到的列出、按编号核对、编号占用判断、
+// 待办与使用资格判断都与改动前完全一致——失败的新器具或目标状态既不提前
+// 生效，也不会在此后其他成功操作写盘时被顺带写入；文件仍不可写时再次提交
+// 仍会走到保存，不会把上一次未保存的内容当成已生效而直接成功。
+//
+// 调用方必须先完成全部业务校验再进入这里：编号重复、非法状态或不存在的
+// 器具都按各自原有原因拒绝，不会因走到写盘而被混成保存失败。
+//
+// 保存成功后返回指定编号器具已保存内容的独立展示副本：调用方对这份结果的
+// 整理不会回写正式台账，也不影响编号占用与使用资格判断。
+func (l *Ledger) saveInstruments(id string, change func(staged []Instrument) []Instrument) (*Instrument, error) {
+	original := l.data.Instruments
+	staged := make([]Instrument, len(original))
+	copy(staged, original)
+	staged = change(staged)
+	l.data.Instruments = staged
+	if err := l.save(); err != nil {
+		l.data.Instruments = original
+		return nil, err
+	}
+	saved := l.findInstrument(id)
+	if saved == nil {
+		return nil, nil
+	}
+	out := *saved
+	return &out, nil
+}
+
 // RegisterInput 是登记器具的输入。
 type RegisterInput struct {
 	ID           string
@@ -291,28 +322,17 @@ func (l *Ledger) Register(in RegisterInput) (*Instrument, error) {
 	if l.findInstrument(id) != nil {
 		return nil, validationError("器具编号 %s 已存在，编号必须唯一", id)
 	}
-	inst := Instrument{
-		ID:           id,
-		Name:         name,
-		AllowedError: in.AllowedError,
-		Status:       StatusPending,
-		RegisteredAt: l.now().Format(time.RFC3339),
-	}
-	// 在独立的新切片上暂存新器具：只有原子替换台账文件成功后才提交。
-	// 写盘失败时恢复原切片，保证同一台账对象随后的列出、按编号核对与编号
-	// 占用判断都与登记前一致，失败器具也不会被之后的写盘顺带写入。
-	original := l.data.Instruments
-	staged := make([]Instrument, 0, len(original)+1)
-	staged = append(staged, original...)
-	staged = append(staged, inst)
-	l.data.Instruments = staged
-	if err := l.save(); err != nil {
-		l.data.Instruments = original
-		return nil, err
-	}
-	// 返回已保存器具的独立副本：返回结果只表示本次保存成功的内容。
-	saved := *l.findInstrument(id)
-	return &saved, nil
+	// 暂存与失败恢复按登记、状态切换共用的 saveInstruments 规则维护：
+	// 只有原子替换台账文件成功后，新器具才算正式登记。
+	return l.saveInstruments(id, func(staged []Instrument) []Instrument {
+		return append(staged, Instrument{
+			ID:           id,
+			Name:         name,
+			AllowedError: in.AllowedError,
+			Status:       StatusPending,
+			RegisteredAt: l.now().Format(time.RFC3339),
+		})
+	})
 }
 
 // SetStatus 切换器具状态。切换为在用不代表已校准；停用不删除证书与使用记录。
@@ -337,25 +357,18 @@ func (l *Ledger) SetStatus(id string, status Status) error {
 	if inst.Status == status {
 		return nil
 	}
-	// 在整份器具切片的独立副本上暂存新状态：只有原子替换台账文件成功后才
-	// 提交。写盘失败时恢复原切片，保证同一台账对象随后看到的器具状态、列出
-	// 结果、待办与使用判断都与切换前一致；再次提交相同状态仍会走到保存，
-	// 失败状态也不会被之后的写盘顺带写入。
-	original := l.data.Instruments
-	staged := make([]Instrument, len(original))
-	copy(staged, original)
-	for i := range staged {
-		if staged[i].ID == id {
-			staged[i].Status = status
-			break
+	// 暂存与失败恢复按登记、状态切换共用的 saveInstruments 规则维护：
+	// 只有原子替换台账文件成功后，新状态才算正式生效。
+	_, err := l.saveInstruments(id, func(staged []Instrument) []Instrument {
+		for i := range staged {
+			if staged[i].ID == id {
+				staged[i].Status = status
+				break
+			}
 		}
-	}
-	l.data.Instruments = staged
-	if err := l.save(); err != nil {
-		l.data.Instruments = original
-		return err
-	}
-	return nil
+		return staged
+	})
+	return err
 }
 
 // CertificateInput 是录入校准证书的输入。
