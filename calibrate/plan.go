@@ -491,14 +491,17 @@ type PlanView struct {
 // 返回的是深拷贝（含改期历史）：调用方整理按器具查询或核对结果中的
 // 计划与改期记录，不会回写台账，也不会影响此前或之后分别取得的其他结果。
 //
-// CreatedAt 是带偏移的 RFC3339 时间：同一件器具的计划可能在不同系统时区
-// 偏移下（含 Z 与显式零偏移）先后建立。排序换算为同一基准下的绝对时刻，
-// 因此不能按时间文字里的日期、小时大小判断先后——文字日期更小或小时更小
-// 的记录未必更早，跨日记录也按实际时刻排列；各记录保存时自带的偏移决定
-// 先后，查询当天的系统时区不能改变这些历史的先后关系。已完成、已取消与
-// 未完成的计划一起参与排序，状态、当前计划日期、改期时间与完成时间均不作
-// 排序条件。实际时刻相同的记录（即使分别使用 Z、+00:00 或其他偏移）由
-// SliceStable 保留其在台账中的原有次序，每项都单独保留、不合并。
+// 时间能否识别、按实际时刻比较以及异常时间的排列，统一走与全部使用申请
+// 记录共用的规则（见 compareHistoryTime）：CreatedAt 是带偏移的 RFC3339
+// 时间，同一件器具的计划可能在不同系统时区偏移下（含 Z 与显式零偏移）先后
+// 建立，按实际时刻排列——不能按时间文字里的日期、小时大小判断先后，文字
+// 日期更小或小时更小的记录未必更早，跨日记录也按实际时刻排列；各记录保存
+// 时自带的偏移决定先后，查询当天的系统时区不能改变这些历史的先后关系。
+// 无法识别建立时间的计划排在有效时间计划之后，彼此按时间原文字升序。
+// 已完成、已取消与未完成的计划一起参与排序，状态、当前计划日期、改期时间
+// 与完成时间均不作排序条件。时间无法区分先后时（实际时刻相同，或两者建立
+// 时间都无法识别且原文字相同）由稳定排序保留其在台账中的原有次序，每项都
+// 单独保留、不合并。
 func (l *Ledger) plansOf(id string) []Plan {
 	var out []Plan
 	for _, p := range l.data.Plans {
@@ -506,24 +509,10 @@ func (l *Ledger) plansOf(id string) []Plan {
 			out = append(out, clonePlan(p))
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseInstant(out[i].CreatedAt)
-		tj, okj := parseInstant(out[j].CreatedAt)
-		switch {
-		case oki && okj:
-			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录建立时
-			// 所带的偏移及文字形式无关；时刻相同时返回 false，交由
-			// SliceStable 保留它们在台账中的原有次序。
-			return ti.Before(tj)
-		case oki != okj:
-			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
-			// 正常由本台账保存的 RFC3339 记录不会走到这里。
-			return oki
-		default:
-			// 两条都无法解析时退回按原文字比较，保证结果确定。
-			return out[i].CreatedAt < out[j].CreatedAt
-		}
-	})
+	// 计划没有器具编号之外的同刻细分：plansOf 只收集同一器具的计划，
+	// 建立时刻相同（含异常时间原文字相同）时直接保留台账原有次序，故不
+	// 传入 tieBefore。
+	sortHistoryByTime(out, func(p Plan) string { return p.CreatedAt }, nil)
 	return out
 }
 

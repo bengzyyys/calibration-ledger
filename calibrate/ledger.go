@@ -750,26 +750,18 @@ func (l *Ledger) Instruments() []Instrument {
 	return out
 }
 
-// parseInstant 把带偏移的 RFC3339 时间（如申请时间、计划建立时间，可带
-// 不同偏移或 Z）解析为实际时刻。不同文字形式（如 Z 与 +00:00）只要表示
-// 同一绝对时刻，解析结果即相同。
-func parseInstant(s string) (time.Time, bool) {
-	t, err := time.Parse(time.RFC3339, s)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return t, true
-}
-
 // UsageRecords 返回全部使用申请记录，按申请发生的实际时刻从早到晚排序。
 //
-// RequestedAt 是带偏移的 RFC3339 时间：同一份台账可保存于不同系统时区偏移
-// （含 Z 与显式零偏移），排序时换算为同一基准下的绝对时刻，因此显示文字里
-// 小时、分钟更大的记录未必更晚，跨日记录也按实际时刻排列；记录各自保存时的
-// 偏移决定先后，查询当天的系统时区不能改变历史顺序。获准与被拒绝的申请一起
-// 参与排序，申请结果不作为排序条件。实际时刻相同的记录按器具编号升序；同一
-// 器具在同一时刻的多次申请保留其在台账中的原有次序，每条已保存申请都保留、
-// 不合并。没有记录时返回空结果，只有一条时原样返回。
+// 时间能否识别、按实际时刻比较以及异常时间的排列，统一走与校准计划历史
+// 共用的规则（见 compareHistoryTime）：RequestedAt 是带偏移的 RFC3339
+// 时间，同一份台账可保存于不同系统时区偏移（含 Z 与显式零偏移），按实际
+// 时刻排列，因此显示文字里小时、分钟更大的记录未必更晚，跨日记录也按实际
+// 时刻排列；记录各自保存时的偏移决定先后，查询当天的系统时区不能改变历史
+// 顺序。无法识别时间的记录排在有效时间记录之后，彼此按时间原文字升序。
+// 获准与被拒绝的申请一起参与排序，申请结果不作为排序条件。实际时刻相同
+// （或两者时间都无法识别且原文字相同）时按器具编号升序；同一器具在同一
+// 时刻的多次申请保留其在台账中的原有次序，每条已保存申请都保留、不合并。
+// 没有记录时返回空结果，只有一条时原样返回。
 //
 // 返回的是展示副本：申请时间保留原文字及偏移，器具编号、申请结果与拒绝原因
 // 保持保存时的内容；整理其中原因不会改动台账内已冻结的留痕，也不会被后续
@@ -779,29 +771,10 @@ func (l *Ledger) UsageRecords() []UsageRecord {
 	for i := range out {
 		out[i].Reasons = cloneReasons(out[i].Reasons)
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		ti, oki := parseInstant(out[i].RequestedAt)
-		tj, okj := parseInstant(out[j].RequestedAt)
-		switch {
-		case oki && okj:
-			// 按实际时刻比较：Equal/Before 以绝对时刻为准，与记录保存时
-			// 所带的偏移及文字形式无关。
-			if !ti.Equal(tj) {
-				return ti.Before(tj)
-			}
-		case oki != okj:
-			// 时间文字无法解析的异常记录排到可解析记录之后，顺序仍确定；
-			// 正常由本台账保存的 RFC3339 记录不会走到这里。
-			return oki
-		default:
-			// 两条都无法解析时退回按原文字比较，保证结果确定。
-			if out[i].RequestedAt != out[j].RequestedAt {
-				return out[i].RequestedAt < out[j].RequestedAt
-			}
-		}
-		// 实际时刻相同：按器具编号升序；编号也相同的同一时刻多次申请由
-		// SliceStable 保留其在台账中的原有次序，不因获准/拒绝结果而变动。
-		return out[i].InstrumentID < out[j].InstrumentID
-	})
+	sortHistoryByTime(out,
+		func(r UsageRecord) string { return r.RequestedAt },
+		// 时间无法区分先后时按器具编号升序；编号也相同的同一时刻多次申请
+		// 由稳定排序保留其在台账中的原有次序，不因获准/拒绝结果而变动。
+		func(a, b UsageRecord) bool { return a.InstrumentID < b.InstrumentID })
 	return out
 }
